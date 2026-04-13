@@ -1,0 +1,697 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+VERSION="1.0.0"
+NIGHTSHIFT_DIR="$HOME/.nightshift"
+CONFIG_FILE="$NIGHTSHIFT_DIR/config.json"
+LOG_DIR="$NIGHTSHIFT_DIR/logs"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -d "$HOME/.local/share/nightshift/prompts" ]]; then
+    PROMPTS_DIR="$HOME/.local/share/nightshift/prompts"
+elif [[ -d "$SCRIPT_DIR/prompts" ]]; then
+    PROMPTS_DIR="$SCRIPT_DIR/prompts"
+else
+    PROMPTS_DIR=""
+fi
+
+ISSUES_CREATED=0
+ISSUES_SKIPPED=0
+ERRORS=0
+
+ALL_AGENTS="bugs security architecture antipatterns dependencies documentation maintainability observability performance solidprinciples techdebt tests"
+
+# --- Logging ---
+
+log() {
+    local timestamp
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "[$timestamp] $*"
+}
+
+# --- Agent metadata ---
+
+get_json_key() {
+    case "$1" in
+        bugs)             echo "bugs" ;;
+        security)         echo "vulnerabilities" ;;
+        architecture)     echo "issues" ;;
+        antipatterns)     echo "migrations" ;;
+        dependencies)     echo "dependencies" ;;
+        documentation)    echo "gaps" ;;
+        maintainability)  echo "tasks" ;;
+        observability)    echo "gaps" ;;
+        performance)      echo "issues" ;;
+        solidprinciples)  echo "violations" ;;
+        techdebt)         echo "items" ;;
+        tests)            echo "gaps" ;;
+        *)                echo "issues" ;;
+    esac
+}
+
+get_label() {
+    case "$1" in
+        bugs)             echo "bug" ;;
+        security)         echo "security" ;;
+        architecture)     echo "architecture" ;;
+        antipatterns)     echo "anti-pattern" ;;
+        dependencies)     echo "dependencies" ;;
+        documentation)    echo "documentation" ;;
+        maintainability)  echo "maintainability" ;;
+        observability)    echo "observability" ;;
+        performance)      echo "performance" ;;
+        solidprinciples)  echo "solid" ;;
+        techdebt)         echo "tech-debt" ;;
+        tests)            echo "testing" ;;
+        *)                echo "$1" ;;
+    esac
+}
+
+get_severity_field() {
+    case "$1" in
+        bugs|security|performance) echo "severity" ;;
+        *)                         echo "priority" ;;
+    esac
+}
+
+# --- Dependency checks ---
+
+check_gh() {
+    if ! command -v gh &>/dev/null; then
+        echo "Error: GitHub CLI (gh) is not installed."
+        echo "Install it: https://cli.github.com/"
+        return 1
+    fi
+    if ! gh auth status &>/dev/null 2>&1; then
+        echo "Error: GitHub CLI is not authenticated."
+        echo "Run: gh auth login"
+        return 1
+    fi
+    return 0
+}
+
+detect_ai_clis() {
+    local found=""
+    for cli in claude codex cursor; do
+        if command -v "$cli" &>/dev/null; then
+            found="${found:+$found }$cli"
+        fi
+    done
+    echo "$found"
+}
+
+# --- AI CLI invocation ---
+
+invoke_cli() {
+    local cli="$1"
+    local prompt_file="$2"
+    local repo_dir="$3"
+
+    local prompt_content
+    prompt_content="$(cat "$prompt_file")"
+
+    cd "$repo_dir"
+    case "$cli" in
+        claude)  claude -p "$prompt_content" 2>/dev/null ;;
+        codex)   codex -q "$prompt_content" 2>/dev/null ;;
+        cursor)  cursor -p "$prompt_content" 2>/dev/null ;;
+        *)
+            echo "Unknown CLI: $cli" >&2
+            return 1
+            ;;
+    esac
+}
+
+# --- JSON extraction ---
+
+extract_json() {
+    local input="$1"
+    if echo "$input" | jq . &>/dev/null 2>&1; then
+        echo "$input"
+        return 0
+    fi
+    local stripped
+    stripped="$(echo "$input" | sed '/^```.*$/d')"
+    if echo "$stripped" | jq . &>/dev/null 2>&1; then
+        echo "$stripped"
+        return 0
+    fi
+    return 1
+}
+
+# --- Config ---
+
+read_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "Error: Config not found at $CONFIG_FILE" >&2
+        echo "Run: nightshift init" >&2
+        return 1
+    fi
+    cat "$CONFIG_FILE"
+}
+
+get_config_value() {
+    local key="$1"
+    read_config | jq -r "$key" 2>/dev/null
+}
+
+get_repos_root() {
+    local root
+    root="$(get_config_value '.repos_root')" || return 1
+    root="${root/#\~/$HOME}"
+    echo "$root"
+}
+
+get_agent_cli() {
+    local agent="$1"
+    get_config_value ".agents.${agent}" 2>/dev/null || echo ""
+}
+
+# --- Per-repo config ---
+
+is_agent_excluded() {
+    local agent="$1"
+    local repo_config="$2"
+    echo "$repo_config" | jq -e ".exclude // [] | index(\"$agent\")" &>/dev/null
+}
+
+get_repo_agent_cli() {
+    local agent="$1"
+    local repo_config="$2"
+    local override
+    override="$(echo "$repo_config" | jq -r ".agents.${agent} // empty" 2>/dev/null)"
+    if [[ -n "$override" ]]; then
+        echo "$override"
+    else
+        get_agent_cli "$agent"
+    fi
+}
+
+# --- Repo discovery ---
+
+discover_repos() {
+    local root="$1"
+    for dir in "$root"/*/; do
+        [[ -d "$dir/.git" ]] && echo "$(cd "$dir" && pwd)"
+    done
+}
+
+# --- Git operations ---
+
+prepare_repo() {
+    local repo_dir="$1"
+    cd "$repo_dir"
+
+    local default_branch
+    default_branch="$(git remote show origin 2>/dev/null | awk '/HEAD branch/{print $NF}')" || default_branch=""
+    if [[ -z "$default_branch" ]]; then
+        default_branch="main"
+    fi
+
+    git checkout "$default_branch" --quiet 2>/dev/null || true
+    git pull --quiet 2>/dev/null || true
+}
+
+# --- GitHub operations ---
+
+fetch_open_issues() {
+    local repo_dir="$1"
+    cd "$repo_dir"
+    gh issue list --state open --label nightshift --limit 500 --json title \
+        2>/dev/null | jq -r '.[].title' 2>/dev/null || echo ""
+}
+
+fetch_open_prs() {
+    local repo_dir="$1"
+    cd "$repo_dir"
+    gh pr list --state open --limit 50 --json title,body 2>/dev/null \
+        | jq -r '.[] | "PR: \(.title)\n\(.body // "")\n---"' 2>/dev/null || echo "None"
+}
+
+is_duplicate() {
+    local title="$1"
+    local existing_titles="$2"
+    echo "$existing_titles" | grep -qFx "$title"
+}
+
+create_github_issue() {
+    local repo_dir="$1"
+    local title="$2"
+    local agent_label="$3"
+    local body="$4"
+
+    cd "$repo_dir"
+    gh issue create \
+        --title "$title" \
+        --label "nightshift,$agent_label" \
+        --body "$body" 2>/dev/null
+}
+
+# --- Process findings ---
+
+process_findings() {
+    local repo_dir="$1"
+    local agent="$2"
+    local json_response="$3"
+    local existing_titles="$4"
+
+    local json_key agent_label severity_field
+    json_key="$(get_json_key "$agent")"
+    agent_label="$(get_label "$agent")"
+    severity_field="$(get_severity_field "$agent")"
+
+    local count
+    count="$(echo "$json_response" | jq -r ".${json_key} | length" 2>/dev/null)" || {
+        log "  Error: Failed to parse JSON for $agent"
+        ERRORS=$((ERRORS + 1))
+        return 1
+    }
+
+    if [[ -z "$count" ]] || [[ "$count" == "null" ]] || [[ "$count" -eq 0 ]]; then
+        return 0
+    fi
+
+    local created=0 skipped=0
+    local i=0
+    while [[ $i -lt $count ]]; do
+        local item
+        item="$(echo "$json_response" | jq ".${json_key}[$i]")"
+
+        local raw_title
+        raw_title="$(echo "$item" | jq -r '.title')"
+        local title="[nightshift] $raw_title"
+
+        local in_progress
+        in_progress="$(echo "$item" | jq -r '.already_in_progress // false')"
+        if [[ "$in_progress" == "true" ]]; then
+            skipped=$((skipped + 1))
+            ISSUES_SKIPPED=$((ISSUES_SKIPPED + 1))
+            i=$((i + 1))
+            continue
+        fi
+
+        if is_duplicate "$title" "$existing_titles"; then
+            skipped=$((skipped + 1))
+            ISSUES_SKIPPED=$((ISSUES_SKIPPED + 1))
+            i=$((i + 1))
+            continue
+        fi
+
+        local severity file line_hint description
+        severity="$(echo "$item" | jq -r "(.${severity_field} // .severity // .priority // \"medium\")")"
+        file="$(echo "$item" | jq -r '(.file // .manifest_file // "N/A")')"
+        line_hint="$(echo "$item" | jq -r '.line_hint // empty' 2>/dev/null)" || line_hint=""
+        description="$(echo "$item" | jq -r '.description')"
+
+        local file_display
+        if [[ -n "$line_hint" ]] && [[ "$line_hint" != "null" ]]; then
+            file_display="\`${file}\` (line ${line_hint})"
+        else
+            file_display="\`${file}\`"
+        fi
+
+        local body
+        body="> 🌙 Raised by nightshift on $(date '+%Y-%m-%d')
+
+**Severity:** ${severity}
+**File:** ${file_display}
+
+${description}"
+
+        if create_github_issue "$repo_dir" "$title" "$agent_label" "$body"; then
+            created=$((created + 1))
+            ISSUES_CREATED=$((ISSUES_CREATED + 1))
+        else
+            ERRORS=$((ERRORS + 1))
+        fi
+
+        i=$((i + 1))
+    done
+
+    log "  $agent → $created issues created, $skipped skipped (duplicate/in-progress)"
+}
+
+# --- cmd: run ---
+
+cmd_run() {
+    log "Starting nightshift run"
+
+    if ! check_gh; then
+        exit 1
+    fi
+
+    if [[ -z "$PROMPTS_DIR" ]] || [[ ! -d "$PROMPTS_DIR" ]]; then
+        log "Error: Prompts directory not found"
+        exit 1
+    fi
+
+    local repos_root
+    repos_root="$(get_repos_root)" || exit 1
+
+    local repos repo_count
+    repos="$(discover_repos "$repos_root")"
+    repo_count="$(echo "$repos" | grep -c . 2>/dev/null || echo 0)"
+    log "Scanning $repo_count repos in $repos_root"
+
+    local repo_dir
+    while IFS= read -r repo_dir; do
+        [[ -z "$repo_dir" ]] && continue
+        local repo_name
+        repo_name="$(basename "$repo_dir")"
+
+        prepare_repo "$repo_dir"
+
+        local existing_titles
+        existing_titles="$(fetch_open_issues "$repo_dir")"
+
+        local open_prs
+        open_prs="$(fetch_open_prs "$repo_dir")"
+
+        local repo_config="{}"
+        if [[ -f "$repo_dir/.nightshift.json" ]]; then
+            repo_config="$(cat "$repo_dir/.nightshift.json")"
+        fi
+
+        local agent
+        for agent in $ALL_AGENTS; do
+            if is_agent_excluded "$agent" "$repo_config"; then
+                continue
+            fi
+
+            local cli
+            cli="$(get_repo_agent_cli "$agent" "$repo_config")"
+            if [[ -z "$cli" ]] || [[ "$cli" == "null" ]]; then
+                continue
+            fi
+
+            local prompt_file="$PROMPTS_DIR/${agent}.md"
+            if [[ ! -f "$prompt_file" ]]; then
+                log "  Warning: Prompt not found: $prompt_file"
+                continue
+            fi
+
+            log "$repo_name: running $agent agent ($cli)"
+
+            local prompt_content
+            prompt_content="$(cat "$prompt_file")"
+            prompt_content="${prompt_content//\$\{open_pr_summary\}/$open_prs}"
+
+            local tmp_prompt
+            tmp_prompt="$(mktemp)"
+            printf '%s' "$prompt_content" > "$tmp_prompt"
+
+            local response
+            if response="$(invoke_cli "$cli" "$tmp_prompt" "$repo_dir" 2>&1)"; then
+                local json_response
+                if json_response="$(extract_json "$response")"; then
+                    process_findings "$repo_dir" "$agent" "$json_response" "$existing_titles"
+                else
+                    log "  Error: Invalid JSON from $agent agent"
+                    ERRORS=$((ERRORS + 1))
+                fi
+            else
+                log "  Error: $agent agent ($cli) failed"
+                ERRORS=$((ERRORS + 1))
+            fi
+
+            rm -f "$tmp_prompt"
+        done
+    done <<< "$repos"
+
+    log "Run complete — $ISSUES_CREATED issues created, $ISSUES_SKIPPED skipped (duplicate), $ERRORS error(s)"
+}
+
+# --- cmd: init ---
+
+cmd_init() {
+    echo "nightshift setup"
+    echo ""
+
+    echo "Checking GitHub CLI..."
+    if ! check_gh; then
+        exit 1
+    fi
+    echo "  gh is installed and authenticated"
+    echo ""
+
+    echo "Detecting AI CLIs..."
+    local available_clis
+    available_clis="$(detect_ai_clis)"
+
+    if [[ -z "$available_clis" ]]; then
+        echo "Error: No supported AI CLI found."
+        echo "Install one of: claude, codex, cursor"
+        exit 1
+    fi
+
+    for cli in $available_clis; do
+        echo "  found: $cli"
+    done
+    echo ""
+
+    local repos_root
+    read -r -p "Repos root directory [~/Developer]: " repos_root
+    repos_root="${repos_root:-~/Developer}"
+    local repos_root_expanded="${repos_root/#\~/$HOME}"
+
+    if [[ ! -d "$repos_root_expanded" ]]; then
+        echo "Error: Directory not found: $repos_root_expanded"
+        exit 1
+    fi
+    echo ""
+
+    local run_hour
+    read -r -p "Run time (hour, 0-23) [2]: " run_hour
+    run_hour="${run_hour:-2}"
+    local schedule="0 $run_hour * * *"
+    echo ""
+
+    echo "Assign an AI CLI to each agent."
+    echo "Available: $available_clis"
+    echo "Press Enter for default, or type 'skip' to disable."
+    echo ""
+
+    local default_cli
+    default_cli="$(echo "$available_clis" | awk '{print $1}')"
+
+    local agents_json="{"
+    local first=true
+    for agent in $ALL_AGENTS; do
+        local chosen
+        read -r -p "  $agent [$default_cli]: " chosen
+        chosen="${chosen:-$default_cli}"
+
+        if [[ "$chosen" == "skip" ]]; then
+            continue
+        fi
+
+        if ! echo " $available_clis " | grep -q " $chosen "; then
+            echo "    '$chosen' not detected, using $default_cli"
+            chosen="$default_cli"
+        fi
+
+        if [[ "$first" == "true" ]]; then
+            first=false
+        else
+            agents_json="${agents_json},"
+        fi
+        agents_json="${agents_json}\"${agent}\":\"${chosen}\""
+    done
+    agents_json="${agents_json}}"
+    echo ""
+
+    mkdir -p "$NIGHTSHIFT_DIR"
+    local config
+    config="$(jq -n \
+        --arg repos_root "$repos_root" \
+        --arg schedule "$schedule" \
+        --argjson agents "$agents_json" \
+        '{repos_root: $repos_root, schedule: $schedule, agents: $agents}')"
+
+    echo "$config" > "$CONFIG_FILE"
+    echo "Config written to $CONFIG_FILE"
+    echo ""
+
+    echo "Creating labels in discovered repos..."
+    local repos
+    repos="$(discover_repos "$repos_root_expanded")"
+
+    local repo_dir
+    while IFS= read -r repo_dir; do
+        [[ -z "$repo_dir" ]] && continue
+        local repo_name
+        repo_name="$(basename "$repo_dir")"
+        echo "  $repo_name"
+
+        cd "$repo_dir"
+        gh label create "nightshift" --description "Raised by nightshift" --color "1d1d8a" --force 2>/dev/null || true
+
+        local agent
+        for agent in $ALL_AGENTS; do
+            local label
+            label="$(get_label "$agent")"
+            gh label create "$label" --force 2>/dev/null || true
+        done
+    done <<< "$repos"
+    echo ""
+
+    register_cron "$schedule"
+
+    echo ""
+    echo "nightshift is ready. Next run: $(describe_schedule "$schedule")"
+}
+
+# --- Cron ---
+
+register_cron() {
+    local schedule="$1"
+    local nightshift_bin
+    nightshift_bin="$(command -v nightshift 2>/dev/null || echo "$SCRIPT_DIR/nightshift")"
+
+    local cron_line="$schedule $nightshift_bin run >> $LOG_DIR/\$(date +\\%Y-\\%m-\\%d).log 2>&1"
+
+    local existing filtered
+    existing="$(crontab -l 2>/dev/null)" || existing=""
+    filtered="$(echo "$existing" | grep -v "nightshift run")" || filtered=""
+
+    mkdir -p "$LOG_DIR"
+
+    if [[ -n "$filtered" ]]; then
+        printf '%s\n%s\n' "$filtered" "$cron_line" | crontab -
+    else
+        echo "$cron_line" | crontab -
+    fi
+
+    echo "Cron registered: $cron_line"
+}
+
+describe_schedule() {
+    local schedule="$1"
+    local hour
+    hour="$(echo "$schedule" | awk '{print $2}')"
+    printf 'daily at %02d:00\n' "$hour"
+}
+
+get_cron_schedule() {
+    crontab -l 2>/dev/null | grep "nightshift run" | awk '{print $1, $2, $3, $4, $5}' || echo ""
+}
+
+# --- cmd: logs ---
+
+cmd_logs() {
+    local date_arg="${1:-}"
+
+    mkdir -p "$LOG_DIR"
+
+    if [[ -n "$date_arg" ]]; then
+        local log_file="$LOG_DIR/${date_arg}.log"
+        if [[ -f "$log_file" ]]; then
+            cat "$log_file"
+        else
+            echo "No log found for $date_arg"
+            exit 1
+        fi
+    else
+        local latest
+        latest="$(ls -t "$LOG_DIR"/*.log 2>/dev/null | head -1)" || latest=""
+        if [[ -z "$latest" ]]; then
+            echo "No logs found in $LOG_DIR"
+            exit 1
+        fi
+        cat "$latest"
+    fi
+}
+
+# --- cmd: status ---
+
+cmd_status() {
+    echo "nightshift status"
+    echo ""
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        echo "Config: $CONFIG_FILE"
+        local repos_root
+        repos_root="$(get_repos_root)" || repos_root="(error reading config)"
+
+        echo "Repos root: $repos_root"
+
+        if [[ -d "$repos_root" ]]; then
+            local repo_count
+            repo_count="$(discover_repos "$repos_root" | grep -c . 2>/dev/null || echo 0)"
+            echo "Repos discovered: $repo_count"
+        fi
+        echo ""
+
+        echo "Agent assignments:"
+        for agent in $ALL_AGENTS; do
+            local cli
+            cli="$(get_agent_cli "$agent")"
+            if [[ -n "$cli" ]] && [[ "$cli" != "null" ]]; then
+                echo "  $agent -> $cli"
+            else
+                echo "  $agent -> (disabled)"
+            fi
+        done
+    else
+        echo "Config: not found (run 'nightshift init')"
+    fi
+    echo ""
+
+    echo "AI CLIs:"
+    for cli in claude codex cursor; do
+        if command -v "$cli" &>/dev/null; then
+            echo "  [ok] $cli"
+        else
+            echo "  [--] $cli (not found)"
+        fi
+    done
+    echo ""
+
+    echo "GitHub CLI:"
+    if command -v gh &>/dev/null; then
+        if gh auth status &>/dev/null 2>&1; then
+            echo "  [ok] gh (authenticated)"
+        else
+            echo "  [--] gh (not authenticated)"
+        fi
+    else
+        echo "  [--] gh (not installed)"
+    fi
+    echo ""
+
+    echo "Schedule:"
+    local cron_schedule
+    cron_schedule="$(get_cron_schedule)"
+    if [[ -n "$cron_schedule" ]]; then
+        echo "  $(describe_schedule "$cron_schedule")"
+    else
+        echo "  not scheduled"
+    fi
+}
+
+# --- Usage ---
+
+usage() {
+    cat <<EOF
+nightshift v${VERSION} — nightly code auditing
+
+Usage:
+  nightshift init       Interactive setup wizard
+  nightshift run        Run a scan now (also used by cron)
+  nightshift logs       View the latest log file
+  nightshift logs DATE  View log for a specific date (YYYY-MM-DD)
+  nightshift status     Show config and detected CLIs
+EOF
+}
+
+# --- Main ---
+
+case "${1:-}" in
+    init)   cmd_init ;;
+    run)    shift; cmd_run "$@" ;;
+    logs)   shift; cmd_logs "$@" ;;
+    status) cmd_status ;;
+    -h|--help|help) usage ;;
+    "")     usage ;;
+    *)      echo "Unknown command: $1"; usage; exit 1 ;;
+esac
