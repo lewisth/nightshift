@@ -129,6 +129,21 @@ Deduplication is by exact title match against open issues. GitHub is the sole so
 
 Run logs are written to `~/.nightshift/logs/YYYY-MM-DD.log` with timestamped entries per repo and agent, plus a summary line at the end of each run.
 
+## Uninstalling
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lewisharper/nightshift/main/uninstall.sh | bash -s -- -y
+```
+
+Or, if you want an interactive confirmation prompt:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lewisharper/nightshift/main/uninstall.sh -o uninstall.sh
+bash uninstall.sh
+```
+
+This removes the `nightshift` binary, the agent prompts, the config and logs directory, and the cron job. It does not touch GitHub labels, AI CLI installations, or AI CLI configuration.
+
 ## Licence
 
 See [LICENCE.md](LICENCE.md).
