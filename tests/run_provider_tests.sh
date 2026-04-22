@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export NIGHTSHIFT_SKIP_MAIN=1
+# shellcheck disable=SC1091
+source "$ROOT/nightshift"
+
+fail() {
+    echo "FAIL: $*" >&2
+    exit 1
+}
+
+assert_json_eq() {
+    local key="$1"
+    local want="$2"
+    local json="$3"
+    local got
+    got="$(echo "$json" | jq -r ".$key")"
+    if [[ "$got" != "$want" ]]; then
+        fail "$key: want $want, got $got (json=$json)"
+    fi
+}
+
+# --- parse_ado_remote ---
+
+m="$(parse_ado_remote 'https://dev.azure.com/contoso/Fabrikam/_git/FabrikamFiber')"
+assert_json_eq org contoso "$m"
+assert_json_eq project Fabrikam "$m"
+assert_json_eq repo FabrikamFiber "$m"
+
+m="$(parse_ado_remote 'https://dev.azure.com/contoso/Fabrikam/_git/FabrikamFiber.git')"
+assert_json_eq repo FabrikamFiber "$m"
+
+m="$(parse_ado_remote 'https://contoso.visualstudio.com/Fabrikam/_git/FabrikamFiber')"
+assert_json_eq org contoso "$m"
+assert_json_eq project Fabrikam "$m"
+assert_json_eq repo FabrikamFiber "$m"
+
+m="$(parse_ado_remote 'https://contoso.visualstudio.com/DefaultCollection/Fabrikam/_git/FabrikamFiber')"
+assert_json_eq org contoso "$m"
+assert_json_eq project "DefaultCollection/Fabrikam" "$m"
+assert_json_eq repo FabrikamFiber "$m"
+
+m="$(parse_ado_remote 'git@ssh.dev.azure.com:v3/contoso/Fabrikam/FabrikamFiber')"
+assert_json_eq org contoso "$m"
+assert_json_eq project Fabrikam "$m"
+assert_json_eq repo FabrikamFiber "$m"
+
+pat='https://PATTOKEN@dev.azure.com/contoso/Fabrikam/_git/FabrikamFiber'
+stripped="$(strip_remote_credentials "$pat")"
+[[ "$stripped" == "https://dev.azure.com/contoso/Fabrikam/_git/FabrikamFiber" ]] || fail "strip PAT url"
+m="$(parse_ado_remote "$stripped")"
+assert_json_eq org contoso "$m"
+
+if parse_ado_remote 'https://github.com/foo/bar.git' &>/dev/null; then
+    fail "github url should not parse as ADO"
+fi
+
+# --- detect_provider (git remotes) ---
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+mkrepo() {
+    local d="$1"
+    local url="$2"
+    mkdir -p "$d"
+    git -C "$d" init --quiet
+    git -C "$d" remote add origin "$url"
+}
+
+mkrepo "$tmp/gh" 'https://github.com/acme/widget.git'
+p="$(detect_provider "$tmp/gh" '{}')"
+[[ "$p" == "github" ]] || fail "github https: $p"
+
+mkrepo "$tmp/ghssh" 'git@github.com:acme/widget.git'
+p="$(detect_provider "$tmp/ghssh" '{}')"
+[[ "$p" == "github" ]] || fail "github ssh: $p"
+
+mkrepo "$tmp/ado" 'https://dev.azure.com/contoso/Fabrikam/_git/FabrikamFiber'
+p="$(detect_provider "$tmp/ado" '{}')"
+[[ "$p" == "azuredevops" ]] || fail "ado modern: $p"
+
+mkrepo "$tmp/unk" 'https://gitlab.com/group/project.git'
+p="$(detect_provider "$tmp/unk" '{}')"
+[[ "$p" == "unknown" ]] || fail "gitlab: $p"
+
+p="$(detect_provider "$tmp/gh" '{"provider":"azuredevops"}')"
+[[ "$p" == "azuredevops" ]] || fail "override provider to ado: $p"
+
+p="$(detect_provider "$tmp/ado" '{"provider":"github"}')"
+[[ "$p" == "github" ]] || fail "override provider to github: $p"
+
+# --- resolved_ado_metadata overrides ---
+
+meta="$(resolved_ado_metadata "$tmp/ado" '{"ado_repo":"OverrideRepo"}')"
+assert_json_eq repo OverrideRepo "$meta"
+assert_json_eq org contoso "$meta"
+
+meta="$(resolved_ado_metadata "$tmp/gh" '{"ado_org":"x","ado_project":"y","ado_repo":"z"}')"
+assert_json_eq org x "$meta"
+assert_json_eq project y "$meta"
+assert_json_eq repo z "$meta"
+
+echo "OK: provider detection tests passed"

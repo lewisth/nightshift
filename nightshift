@@ -196,6 +196,114 @@ discover_repos() {
     done
 }
 
+# --- Git remote / provider detection ---
+
+strip_remote_credentials() {
+    local url="$1"
+    if [[ "$url" =~ ^https?://[^/@]+@ ]]; then
+        echo "$url" | sed -E 's#^(https?://)[^/@]+@#\1#'
+    else
+        echo "$url"
+    fi
+}
+
+# Parses an Azure DevOps Git remote URL. On success prints JSON:
+# {"org":"...","project":"...","repo":"..."} and returns 0.
+# Supports modern HTTPS, legacy visualstudio.com HTTPS, SSH (v3), and PAT-embedded HTTPS
+# (pass the URL after strip_remote_credentials).
+parse_ado_remote() {
+    local raw="$1"
+    local url="${raw%/}"
+    local org project repo
+
+    shopt -s nocasematch
+
+    if [[ "$url" =~ ^git@ssh\.dev\.azure\.com:v3/([^/]+)/([^/]+)/([^/]+)$ ]]; then
+        org="${BASH_REMATCH[1]}"
+        project="${BASH_REMATCH[2]}"
+        repo="${BASH_REMATCH[3]}"
+    elif [[ "$url" =~ ^https://dev\.azure\.com/([^/]+)/([^/]+)/_git/([^/]+)$ ]]; then
+        org="${BASH_REMATCH[1]}"
+        project="${BASH_REMATCH[2]}"
+        repo="${BASH_REMATCH[3]}"
+    elif [[ "$url" =~ ^https://([^.]+)\.visualstudio\.com/(.+)/_git/([^/]+)$ ]]; then
+        org="${BASH_REMATCH[1]}"
+        project="${BASH_REMATCH[2]}"
+        repo="${BASH_REMATCH[3]}"
+    else
+        shopt -u nocasematch
+        return 1
+    fi
+
+    shopt -u nocasematch
+
+    repo="${repo%.git}"
+    jq -cn --arg org "$org" --arg project "$project" --arg repo "$repo" \
+        '{org: $org, project: $project, repo: $repo}'
+}
+
+# Reads git remote get-url origin for repo_dir. Prints github, azuredevops, or unknown.
+# Optional repo_config JSON may override .provider (github|azuredevops|unknown only).
+detect_provider() {
+    local repo_dir="$1"
+    local repo_config="${2-}"
+    [[ -z "$repo_config" ]] && repo_config="{}"
+
+    local remote_url normalized
+    remote_url="$(git -C "$repo_dir" remote get-url origin 2>/dev/null || true)"
+    normalized="$(strip_remote_credentials "$remote_url")"
+
+    local detected="unknown"
+    if [[ -n "$normalized" ]]; then
+        if [[ "$normalized" == *"github.com"* ]]; then
+            detected="github"
+        elif parse_ado_remote "$normalized" &>/dev/null; then
+            detected="azuredevops"
+        fi
+    fi
+
+    local override
+    override="$(echo "$repo_config" | jq -r '.provider // empty' 2>/dev/null || true)"
+    if [[ -n "$override" ]] && [[ "$override" != "null" ]]; then
+        case "$override" in
+            github|azuredevops|unknown) detected="$override" ;;
+        esac
+    fi
+
+    echo "$detected"
+}
+
+# ADO org/project/repo from origin URL merged with .nightshift.json ado_* overrides.
+resolved_ado_metadata() {
+    local repo_dir="$1"
+    local repo_config="${2-}"
+    [[ -z "$repo_config" ]] && repo_config="{}"
+
+    local remote_url normalized parsed
+    remote_url="$(git -C "$repo_dir" remote get-url origin 2>/dev/null || true)"
+    normalized="$(strip_remote_credentials "$remote_url")"
+    parsed="null"
+    if p="$(parse_ado_remote "$normalized" 2>/dev/null)"; then
+        parsed="$p"
+    fi
+
+    jq -n \
+        --argjson parsed "$parsed" \
+        --argjson cfg "$repo_config" \
+        '
+        (if $parsed == null then {"org": null, "project": null, "repo": null} else $parsed end)
+        | .org = (
+            if ($cfg.ado_org | type == "string") and ($cfg.ado_org | length) > 0
+            then $cfg.ado_org else .org end)
+        | .project = (
+            if ($cfg.ado_project | type == "string") and ($cfg.ado_project | length) > 0
+            then $cfg.ado_project else .project end)
+        | .repo = (
+            if ($cfg.ado_repo | type == "string") and ($cfg.ado_repo | length) > 0
+            then $cfg.ado_repo else .repo end)
+        '
+}
+
 # --- Git operations ---
 
 prepare_repo() {
@@ -619,6 +727,24 @@ cmd_status() {
             local repo_count
             repo_count="$(discover_repos "$repos_root" | grep -c . 2>/dev/null || echo 0)"
             echo "Repos discovered: $repo_count"
+
+            local repo_dir rcfg provider ado_line
+            while IFS= read -r repo_dir; do
+                [[ -z "$repo_dir" ]] && continue
+                rcfg="{}"
+                if [[ -f "$repo_dir/.nightshift.json" ]]; then
+                    rcfg="$(cat "$repo_dir/.nightshift.json")"
+                fi
+                provider="$(detect_provider "$repo_dir" "$rcfg")"
+                ado_line=""
+                if [[ "$provider" == "azuredevops" ]]; then
+                    ado_line="$(resolved_ado_metadata "$repo_dir" "$rcfg" | jq -r '
+                        if (.org | type == "string") and (.project | type == "string") and (.repo | type == "string")
+                        then " (" + .org + "/" + .project + "/" + .repo + ")"
+                        else "" end' 2>/dev/null || true)"
+                fi
+                echo "  $(basename "$repo_dir"): $provider${ado_line}"
+            done <<< "$(discover_repos "$repos_root")"
         fi
         echo ""
 
@@ -686,6 +812,7 @@ EOF
 
 # --- Main ---
 
+if [[ -z "${NIGHTSHIFT_SKIP_MAIN:-}" ]]; then
 case "${1:-}" in
     init)   cmd_init ;;
     run)    shift; cmd_run "$@" ;;
@@ -695,3 +822,4 @@ case "${1:-}" in
     "")     usage ;;
     *)      echo "Unknown command: $1"; usage; exit 1 ;;
 esac
+fi
