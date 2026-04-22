@@ -36,4 +36,25 @@ echo ""
 echo "nightshift installed to $INSTALL_DIR/nightshift"
 echo "Prompts installed to $SHARE_DIR/prompts/"
 echo ""
-echo "Run 'nightshift init' to get started."
+
+repos_root=""
+read -r -p "Repos root directory [~/Developer]: " repos_root || true
+repos_root="${repos_root:-~/Developer}"
+repos_root_expanded="${repos_root/#\~/$HOME}"
+
+if [[ ! -d "$repos_root_expanded" ]]; then
+    echo "Error: Directory not found: $repos_root_expanded"
+    echo "Run 'nightshift init' after fixing the path."
+    exit 1
+fi
+
+if NS_CHECK_ROOT="$repos_root_expanded" NIGHTSHIFT_SKIP_MAIN=1 bash -c "source \"$INSTALL_DIR/nightshift\"; init_root_has_ado_repos \"\$NS_CHECK_ROOT\""; then
+    echo ""
+    echo "Azure DevOps repositories detected under $repos_root_expanded."
+    echo "Continuing with nightshift setup (same as 'nightshift init')..."
+    echo ""
+    NIGHTSHIFT_INIT_REPOS_ROOT="$repos_root_expanded" "$INSTALL_DIR/nightshift" init
+else
+    echo ""
+    echo "Run 'nightshift init' to get started."
+fi

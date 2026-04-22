@@ -528,4 +528,21 @@ if init_ado_repo_fully_configured '{"ado_work_item_type":"Bug","ado_fields":{}}'
   fail "init_ado_repo_fully_configured should fail when field missing"
 fi
 
+# --- init_root_has_ado_repos ---
+
+mkdir -p "$tmp_root/initscan"
+mkrepo "$tmp_root/initscan/ghonly" 'https://github.com/a/b.git'
+if init_root_has_ado_repos "$tmp_root/initscan"; then
+  fail "init_root_has_ado_repos should be false for GitHub-only root"
+fi
+
+mkrepo "$tmp_root/initscan/adoproj" 'https://dev.azure.com/contoso/Fabrikam/_git/FabrikamFiber'
+if ! init_root_has_ado_repos "$tmp_root/initscan"; then
+  fail "init_root_has_ado_repos should be true when any ADO repo exists"
+fi
+
+if init_root_has_ado_repos "$tmp_root/nonexistent_dir_ado_test"; then
+  fail "init_root_has_ado_repos should be false for missing directory"
+fi
+
 echo "OK: ADO REST tests passed"

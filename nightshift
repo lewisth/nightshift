@@ -1550,6 +1550,28 @@ init_wit_to_short_label() {
     esac
 }
 
+# Returns 0 if any repo under root (discover_repos) has detect_provider == azuredevops
+init_root_has_ado_repos() {
+    local root="$1"
+    if [[ ! -d "$root" ]]; then
+        return 1
+    fi
+    local repos_preview repo_line pc pv
+    repos_preview="$(discover_repos "$root")"
+    while IFS= read -r repo_line; do
+        [[ -z "$repo_line" ]] && continue
+        pc="{}"
+        if [[ -f "$repo_line/.nightshift.json" ]]; then
+            pc="$(cat "$repo_line/.nightshift.json")"
+        fi
+        pv="$(detect_provider "$repo_line" "$pc")"
+        if [[ "$pv" == "azuredevops" ]]; then
+            return 0
+        fi
+    done <<< "$repos_preview"
+    return 1
+}
+
 cmd_init() {
     echo "nightshift setup"
     echo ""
@@ -1570,9 +1592,15 @@ cmd_init() {
     echo ""
 
     local repos_root
-    read -r -p "Repos root directory [~/Developer]: " repos_root
-    repos_root="${repos_root:-~/Developer}"
-    local repos_root_expanded="${repos_root/#\~/$HOME}"
+    local repos_root_expanded
+    if [[ -n "${NIGHTSHIFT_INIT_REPOS_ROOT:-}" ]]; then
+        repos_root_expanded="${NIGHTSHIFT_INIT_REPOS_ROOT}"
+        repos_root="$repos_root_expanded"
+    else
+        read -r -p "Repos root directory [~/Developer]: " repos_root
+        repos_root="${repos_root:-~/Developer}"
+        repos_root_expanded="${repos_root/#\~/$HOME}"
+    fi
 
     if [[ ! -d "$repos_root_expanded" ]]; then
         echo "Error: Directory not found: $repos_root_expanded"
