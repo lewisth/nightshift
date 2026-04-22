@@ -23,6 +23,8 @@ while [[ $# -gt 0 ]]; do
     -w) wfmt="$2"; shift 2 ;;
     -H) shift 2 ;;
     -u) shift 2 ;;
+    -X) shift 2 ;;
+    -d|--data-binary) shift 2 ;;
     *) pos+=("$1"); shift ;;
   esac
 done
@@ -32,14 +34,36 @@ if [[ -n "$NIGHTSHIFT_MOCK_CURL_LOG" ]]; then
   printf '%s' "$url" > "$NIGHTSHIFT_MOCK_CURL_LOG"
 fi
 code="${NIGHTSHIFT_MOCK_HTTP_CODE:-200}"
-if [[ -z "${NIGHTSHIFT_MOCK_BODY+x}" ]]; then
-  if [[ "$code" =~ ^2 ]]; then
+body=""
+if [[ -n "${NIGHTSHIFT_MOCK_STATE:-}" ]]; then
+  prev="$(cat "$NIGHTSHIFT_MOCK_STATE" 2>/dev/null || echo 0)"
+  n=$((prev + 1))
+  echo "$n" > "$NIGHTSHIFT_MOCK_STATE"
+  case "$n" in
+    1)
+      body='{"workItems":[{"id":42,"url":"u1"},{"id":43,"url":"u2"}]}'
+      ;;
+    2)
+      body='{"count":2,"value":[{"id":42,"fields":{"System.Title":"Alpha"}},{"id":43,"fields":{"System.Title":"Beta"}}]}'
+      ;;
+    *)
+      if [[ -n "${NIGHTSHIFT_MOCK_BODY+x}" ]]; then
+        body="$NIGHTSHIFT_MOCK_BODY"
+      elif [[ "$code" =~ ^2 ]]; then
+        body='{"value":[]}'
+      else
+        body="{\"typeKey\":\"Error\",\"message\":\"test error for HTTP $code\"}"
+      fi
+      ;;
+  esac
+else
+  if [[ -n "${NIGHTSHIFT_MOCK_BODY+x}" ]]; then
+    body="$NIGHTSHIFT_MOCK_BODY"
+  elif [[ "$code" =~ ^2 ]]; then
     body='{"value":[]}'
   else
     body="{\"typeKey\":\"Error\",\"message\":\"test error for HTTP $code\"}"
   fi
-else
-  body="$NIGHTSHIFT_MOCK_BODY"
 fi
 if [[ -n "$outf" ]]; then
   printf '%s' "$body" > "$outf"
@@ -134,5 +158,83 @@ if check_ado_auth 2>"$errdir/errca"; then
   fail "check_ado_auth without org should fail"
 fi
 grep -q "organization" "$errdir/errca" || fail "expected org error: $(cat "$errdir/errca")"
+
+# --- ado_api_post_request ---
+
+export NIGHTSHIFT_ADO_PAT="test-pat"
+logf2="$(mktemp)"
+export NIGHTSHIFT_MOCK_CURL_LOG="$logf2"
+export NIGHTSHIFT_MOCK_HTTP_CODE=200
+unset NIGHTSHIFT_MOCK_STATE
+export NIGHTSHIFT_MOCK_BODY='{"queryType":"flat","queryResultType":"workItem"}'
+if ! out="$(ado_api_post_request "https://dev.azure.com/contoso" "Fabrikam/_apis/wit/wiql" '{"query":"SELECT [System.Id] FROM WorkItems"}')"; then
+  fail "post 200: $out"
+fi
+if ! echo "$out" | jq -e .queryType &>/dev/null; then
+  fail "post JSON: $out"
+fi
+u2="$(cat "$logf2")"
+if [[ "$u2" != *"Fabrikam/_apis/wit/wiql"* ]] || [[ "$u2" != *"api-version=7.1"* ]]; then
+  fail "post URL: $u2"
+fi
+unset NIGHTSHIFT_MOCK_BODY
+
+export NIGHTSHIFT_MOCK_HTTP_CODE=401
+export NIGHTSHIFT_MOCK_BODY='{"message":"not authorized"}'
+if ado_api_post_request "https://dev.azure.com/contoso" "p/_apis/wit/wiql" '{}' 2>"$errdir/errpost401"; then
+  fail "post 401 should fail"
+fi
+grep -q "rejected" "$errdir/errpost401" || fail "post 401 msg: $(cat "$errdir/errpost401")"
+unset NIGHTSHIFT_MOCK_BODY
+
+# --- fetch_ado_work_items ---
+
+mkrepo() {
+  local d="$1"
+  local url="$2"
+  mkdir -p "$d"
+  git -C "$d" init --quiet
+  git -C "$d" remote add origin "$url"
+}
+
+unset NIGHTSHIFT_ADO_PAT
+out="$(fetch_ado_work_items "$tmp_root/x" '{}')"
+if [[ -n "$out" ]]; then
+  fail "missing PAT should yield empty titles"
+fi
+
+export NIGHTSHIFT_ADO_PAT="test-pat"
+mkrepo "$tmp_root/ghonly" 'https://github.com/a/b.git'
+out="$(fetch_ado_work_items "$tmp_root/ghonly" '{}')"
+if [[ -n "$out" ]]; then
+  fail "github repo without ado metadata should yield empty: $out"
+fi
+
+mkrepo "$tmp_root/adowiql" 'https://dev.azure.com/contoso/Fabrikam/_git/FabrikamFiber'
+export NIGHTSHIFT_MOCK_HTTP_CODE=200
+export NIGHTSHIFT_MOCK_STATE="$tmp_root/seqwiql"
+echo 0 > "$NIGHTSHIFT_MOCK_STATE"
+unset NIGHTSHIFT_MOCK_BODY
+out="$(fetch_ado_work_items "$tmp_root/adowiql" '{}')"
+unset NIGHTSHIFT_MOCK_STATE
+if [[ "$out" != $'Alpha\nBeta' ]]; then
+  fail "want Alpha/Beta titles, got: $out"
+fi
+
+unset NIGHTSHIFT_MOCK_STATE
+export NIGHTSHIFT_MOCK_BODY='{"workItems":[]}'
+export NIGHTSHIFT_MOCK_HTTP_CODE=200
+out="$(fetch_ado_work_items "$tmp_root/adowiql" '{}')"
+unset NIGHTSHIFT_MOCK_BODY
+if [[ -n "$out" ]]; then
+  fail "empty workItems should yield empty string"
+fi
+
+export NIGHTSHIFT_MOCK_HTTP_CODE=503
+unset NIGHTSHIFT_MOCK_STATE
+out="$(fetch_ado_work_items "$tmp_root/adowiql" '{}')"
+if [[ -n "$out" ]]; then
+  fail "API error should yield empty titles"
+fi
 
 echo "OK: ADO REST tests passed"
