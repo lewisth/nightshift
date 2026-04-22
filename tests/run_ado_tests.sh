@@ -237,4 +237,51 @@ if [[ -n "$out" ]]; then
   fail "API error should yield empty titles"
 fi
 
+# --- fetch_ado_prs ---
+
+unset NIGHTSHIFT_ADO_PAT
+out="$(fetch_ado_prs "$tmp_root/x" '{}')"
+if [[ "$out" != "None" ]]; then
+  fail "missing PAT should yield None for PRs: $out"
+fi
+
+export NIGHTSHIFT_ADO_PAT="test-pat"
+mkrepo "$tmp_root/adoprs" 'https://dev.azure.com/contoso/Fabrikam/_git/FabrikamFiber'
+out="$(fetch_ado_prs "$tmp_root/adoprs" '{}')"
+if [[ "$out" != "None" ]]; then
+  fail "PR fetch with no mock body: expected None, got: $out"
+fi
+
+pr_log="$(mktemp)"
+export NIGHTSHIFT_MOCK_CURL_LOG="$pr_log"
+export NIGHTSHIFT_MOCK_HTTP_CODE=200
+export NIGHTSHIFT_MOCK_BODY='{"value":[{"title":"Fix bug","description":"Details here"},{"title":"WIP","description":null}]}'
+out="$(fetch_ado_prs "$tmp_root/adoprs" '{}')"
+want=$'PR: Fix bug\nDetails here\n---\nPR: WIP\n\n---'
+if [[ "$out" != "$want" ]]; then
+  fail "PR format mismatch, got: $(printf %s "$out" | od -c | head -5) want: $(printf %s "$want" | od -c | head -5)"
+fi
+pr_url="$(cat "$pr_log")"
+if [[ "$pr_url" != *"pullrequests"* ]] || [[ "$pr_url" != *"searchCriteria.status=active"* ]]; then
+  fail "unexpected PR API URL: $pr_url"
+fi
+if [[ "$pr_url" != *"api-version=7.1"* ]]; then
+  fail "PR URL missing api-version: $pr_url"
+fi
+unset NIGHTSHIFT_MOCK_BODY
+
+export NIGHTSHIFT_MOCK_BODY='{"value":[]}'
+out="$(fetch_ado_prs "$tmp_root/adoprs" '{}')"
+unset NIGHTSHIFT_MOCK_BODY
+if [[ "$out" != "None" ]]; then
+  fail "empty value[] should be None, got: $out"
+fi
+
+export NIGHTSHIFT_MOCK_HTTP_CODE=503
+unset NIGHTSHIFT_MOCK_BODY
+out="$(fetch_ado_prs "$tmp_root/adoprs" '{}')"
+if [[ "$out" != "None" ]]; then
+  fail "PR API error should yield None, got: $out"
+fi
+
 echo "OK: ADO REST tests passed"

@@ -573,6 +573,64 @@ fetch_ado_work_items() {
     printf '%s' "$titles"
 }
 
+# fetch_ado_prs <repo_dir> [repo_config_json]
+# Active PRs via GET .../pullrequests?searchCriteria.status=active. Same text shape as fetch_open_prs
+# (PR: title, body, ---). Prints "None" if there are no active PRs, on API error, or if metadata/PAT is missing.
+fetch_ado_prs() {
+    local repo_dir="$1"
+    local repo_config="${2-}"
+    [[ -z "$repo_config" ]] && repo_config="{}"
+
+    if ! require_ado_pat; then
+        echo "None"
+        return 0
+    fi
+
+    local meta org project reponame
+    meta="$(resolved_ado_metadata "$repo_dir" "$repo_config")"
+    org="$(echo "$meta" | jq -r '.org // empty')"
+    project="$(echo "$meta" | jq -r '.project // empty')"
+    reponame="$(echo "$meta" | jq -r '.repo // empty')"
+
+    if [[ -z "$org" ]] || [[ -z "$project" ]] || [[ -z "$reponame" ]] || [[ "$org" == "null" ]]; then
+        echo "None"
+        return 0
+    fi
+
+    local base enc_project enc_repo pr_path pr_json
+    base="https://dev.azure.com/${org}"
+    enc_project="$(jq -rn --arg p "$project" '$p|@uri')"
+    enc_repo="$(jq -rn --arg r "$reponame" '$r|@uri')"
+    pr_path="${enc_project}/_apis/git/repositories/${enc_repo}/pullrequests?searchCriteria.status=active"
+
+    if ! pr_json="$(ado_api_request "$base" "$pr_path")"; then
+        echo "None"
+        return 0
+    fi
+
+    local n
+    n="$(echo "$pr_json" | jq -r '.value | length' 2>/dev/null)" || n="0"
+    if ! [[ "$n" =~ ^[0-9]+$ ]]; then
+        n="0"
+    fi
+    if [[ "$n" -eq 0 ]]; then
+        echo "None"
+        return 0
+    fi
+
+    local formatted
+    if ! formatted="$(echo "$pr_json" | jq -r '.value[]? | "PR: \(.title)\n\(.description // "")\n---"' 2>/dev/null)"; then
+        log "  Error: Failed to parse Azure DevOps pull request JSON"
+        echo "None"
+        return 0
+    fi
+    if [[ -z "$formatted" ]]; then
+        echo "None"
+    else
+        printf '%s' "$formatted"
+    fi
+}
+
 # check_ado_auth <organization>
 # Validates NIGHTSHIFT_ADO_PAT against GET .../_apis/projects?%24top=1 (dev.azure.com).
 check_ado_auth() {
@@ -771,7 +829,11 @@ cmd_run() {
         fi
 
         local open_prs
-        open_prs="$(fetch_open_prs "$repo_dir")"
+        if [[ "$provider" == "azuredevops" ]]; then
+            open_prs="$(fetch_ado_prs "$repo_dir" "$repo_config")"
+        else
+            open_prs="$(fetch_open_prs "$repo_dir")"
+        fi
 
         local agent
         for agent in $ALL_AGENTS; do
