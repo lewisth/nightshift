@@ -304,6 +304,122 @@ resolved_ado_metadata() {
         '
 }
 
+# --- Azure DevOps REST (api-version=7.1) ---
+
+# Ensures NIGHTSHIFT_ADO_PAT is set. Prints to stderr and returns 1 if missing.
+require_ado_pat() {
+    if [[ -z "${NIGHTSHIFT_ADO_PAT:-}" ]]; then
+        echo "Error: NIGHTSHIFT_ADO_PAT is not set. Set this environment variable to an Azure DevOps personal access token (PAT) with access to the organization you use with nightshift." >&2
+        return 1
+    fi
+    return 0
+}
+
+# Internal: GET request with Basic auth. Override NIGHTSHIFT_CURL in tests (must support curl CLI).
+_nightshift_ado_curl() {
+    "${NIGHTSHIFT_CURL:-curl}" "$@"
+}
+
+# ado_api_request <ado_root_url> <path>
+# ado_root_url: e.g. https://dev.azure.com/myorg (no trailing slash)
+# path: API path, optional query (e.g. _apis/projects?%24top=1)
+# On success, prints the JSON body (validated) to stdout. On failure, prints a clear error to stderr.
+ado_api_request() {
+    if ! require_ado_pat; then
+        return 1
+    fi
+    local base="${1-}" path="${2-}"
+    if [[ -z "$base" ]] || [[ -z "$path" ]]; then
+        echo "ado_api_request: usage: ado_api_request <ado_root_url> <path>" >&2
+        return 1
+    fi
+    path="${path#/}"
+    local apath
+    if [[ "$path" == *"?"* ]]; then
+        apath="${path}&api-version=7.1"
+    else
+        apath="${path}?api-version=7.1"
+    fi
+    local url="${base%/}/${apath}"
+
+    local tmp
+    tmp="$(mktemp)"
+    local http_code
+    if ! http_code="$(_nightshift_ado_curl -sS -o "$tmp" -w '%{http_code}' \
+        -H "Accept: application/json" \
+        -u ":$NIGHTSHIFT_ADO_PAT" \
+        "$url")"; then
+        rm -f "$tmp"
+        echo "Error: Network request to Azure DevOps failed (connection or TLS error). Check your network and that the URL is correct: $url" >&2
+        return 1
+    fi
+
+    local body
+    body="$(cat "$tmp" 2>/dev/null || true)"
+    rm -f "$tmp"
+
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        if [[ -z "$body" ]]; then
+            echo "Error: Azure DevOps returned an empty body (HTTP $http_code)." >&2
+            return 1
+        fi
+        if ! echo "$body" | jq -e . &>/dev/null; then
+            echo "Error: Azure DevOps returned a non-JSON response (HTTP $http_code). Body was not valid JSON." >&2
+            return 1
+        fi
+        echo "$body" | jq .
+        return 0
+    fi
+
+    local detail=""
+    if [[ -n "$body" ]] && echo "$body" | jq -e . &>/dev/null; then
+        detail="$(echo "$body" | jq -r '(.message // .value // .) | if type == "string" then . else tostring end' 2>/dev/null)" || detail=""
+    fi
+    if [[ -n "$detail" ]] && [[ "$detail" != "null" ]]; then
+        detail=" $detail"
+    else
+        detail=""
+    fi
+
+    case "$http_code" in
+        401)
+            echo "Error: Azure DevOps rejected the personal access token (HTTP 401).${detail} — Verify that NIGHTSHIFT_ADO_PAT is correct, not expired, and has the required API scopes (e.g. code read) for the target organization." >&2
+            ;;
+        403)
+            echo "Error: Access denied to Azure DevOps (HTTP 403).${detail} — The token may be valid but lacks permission for this resource, or a policy is blocking the request." >&2
+            ;;
+        404)
+            echo "Error: Azure DevOps resource not found (HTTP 404).${detail} — Check the organization name, collection URL, and API path. If the organization or project was renamed or does not exist, the URL will not resolve." >&2
+            ;;
+        500|501|502|503|504)
+            echo "Error: Azure DevOps service error (HTTP $http_code).${detail} — Try again later; the service or your organization may be temporarily unavailable." >&2
+            ;;
+        *)
+            echo "Error: Azure DevOps request failed (HTTP $http_code).${detail} — $url" >&2
+            ;;
+    esac
+    return 1
+}
+
+# check_ado_auth <organization>
+# Validates NIGHTSHIFT_ADO_PAT against GET .../_apis/projects?%24top=1 (dev.azure.com).
+check_ado_auth() {
+    local org="${1-}"
+    if [[ -z "$org" ]]; then
+        echo "check_ado_auth: organization name is required (e.g. the segment after https://dev.azure.com/)" >&2
+        return 1
+    fi
+    if ! require_ado_pat; then
+        return 1
+    fi
+    local base="https://dev.azure.com/${org}"
+    if ! ado_api_request "$base" "_apis/projects?%24top=1" >/dev/null; then
+        return 1
+    fi
+    echo "Azure DevOps authentication OK for organization '$org' (PAT accepted)."
+    return 0
+}
+
 # --- Git operations ---
 
 prepare_repo() {
@@ -807,6 +923,8 @@ Usage:
   nightshift logs       View the latest log file
   nightshift logs DATE  View log for a specific date (YYYY-MM-DD)
   nightshift status     Show config and detected CLIs
+  nightshift check-ado-auth ORG
+                        Verify NIGHTSHIFT_ADO_PAT against Azure DevOps (projects API)
 EOF
 }
 
@@ -818,6 +936,7 @@ case "${1:-}" in
     run)    shift; cmd_run "$@" ;;
     logs)   shift; cmd_logs "$@" ;;
     status) cmd_status ;;
+    check-ado-auth) shift; check_ado_auth "${1-}" || exit 1 ;;
     -h|--help|help) usage ;;
     "")     usage ;;
     *)      echo "Unknown command: $1"; usage; exit 1 ;;

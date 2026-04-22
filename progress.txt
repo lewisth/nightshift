@@ -3,3 +3,5 @@
 # Started: 2026-04-22T20:28:00Z
 
 #8 (2026-04-22): Added strip_remote_credentials, parse_ado_remote (four ADO URL shapes), detect_provider (origin + .nightshift.json provider override), and resolved_ado_metadata (ado_* overrides). Extended status to list each repo’s provider; NIGHTSHIFT_SKIP_MAIN for tests. Tests: tests/run_provider_tests.sh. Push to main blocked (branch protection); pushed branch fix/issue-8-provider-detection for PR.
+
+#9 (2026-04-22): Added ado_api_request (Basic auth, api-version=7.1, HTTP error messages for 401/403/404/5xx) and check_ado_auth (GET _apis/projects?%24top=1 on dev.azure.com), plus check-ado-auth CLI. PAT from NIGHTSHIFT_ADO_PAT; NIGHTSHIFT_CURL override for tests. Tests: tests/run_ado_tests.sh. shellcheck not available locally.
