@@ -481,4 +481,51 @@ out="$(ado_bash "$status_home" 'cmd_status')"
 unset NIGHTSHIFT_MOCK_BODY
 echo "$out" | grep -Fq "[--] PAT (invalid)" || fail "status: want invalid PAT, got: $out"
 
+# --- ADO work item type fields (required discovery) ---
+
+mock_fields='{"value":[
+  {"alwaysRequired":true,"referenceName":"System.Title","name":"Title"},
+  {"alwaysRequired":true,"referenceName":"Custom.Req","name":"Custom Req"},
+  {"alwaysRequired":true,"referenceName":"System.State","name":"State"},
+  {"alwaysRequired":false,"referenceName":"System.Tags","name":"Tags"}
+]}'
+out="$(ado_wit_fields_response_to_required_prompt_json "$mock_fields")"
+if [[ "$(echo "$out" | jq 'length')" != "1" ]]; then
+  fail "expected one required prompt field, got: $out"
+fi
+if [[ "$(echo "$out" | jq -r '.[0].referenceName')" != "Custom.Req" ]]; then
+  fail "expected Custom.Req only: $out"
+fi
+
+if [[ "$(ado_uri_encode_wit_type_segment "Product Backlog Item")" != "Product%20Backlog%20Item" ]]; then
+  fail "WIT URI segment for PBI"
+fi
+
+export NIGHTSHIFT_ADO_PAT="test-pat"
+fld_log="$(mktemp)"
+export NIGHTSHIFT_MOCK_CURL_LOG="$fld_log"
+export NIGHTSHIFT_MOCK_HTTP_CODE=200
+export NIGHTSHIFT_MOCK_BODY="$mock_fields"
+out="$(ado_fetch_wit_required_fields_json "contoso" "Fabrikam" "Bug")"
+unset NIGHTSHIFT_MOCK_BODY
+u_f="$(cat "$fld_log")"
+if [[ "$u_f" != *"Fabrikam/_apis/wit/workitemtypes/Bug/fields"* ]] || [[ "$u_f" != *"api-version=7.1"* ]]; then
+  fail "WIT fields URL: $u_f"
+fi
+if [[ "$(echo "$out" | jq 'length')" != "1" ]]; then
+  fail "fetch required fields json: $out"
+fi
+
+cfg_ok='{"ado_work_item_type":"Bug","ado_fields":{"Custom.Req":"v1"}}'
+req_one='[{"referenceName":"Custom.Req","name":"Custom Req"}]'
+if ! init_ado_repo_fully_configured "$cfg_ok" "$req_one" "Bug"; then
+  fail "init_ado_repo_fully_configured should pass"
+fi
+if init_ado_repo_fully_configured "$cfg_ok" "$req_one" "Task"; then
+  fail "init_ado_repo_fully_configured should fail on type mismatch"
+fi
+if init_ado_repo_fully_configured '{"ado_work_item_type":"Bug","ado_fields":{}}' "$req_one" "Bug"; then
+  fail "init_ado_repo_fully_configured should fail when field missing"
+fi
+
 echo "OK: ADO REST tests passed"

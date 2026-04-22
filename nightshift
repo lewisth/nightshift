@@ -920,6 +920,93 @@ check_ado_auth() {
     return 0
 }
 
+# ado_uri_encode_wit_type_segment <work_item_type_name>
+# Path segment for .../workitemtypes/{segment}/fields (URI-encoded type name per REST docs).
+ado_uri_encode_wit_type_segment() {
+    local t="${1-}"
+    jq -rn --arg wit "$t" '$wit|@uri'
+}
+
+# ado_wit_fields_response_to_required_prompt_json <json_body>
+# JSON array of {referenceName, name} for alwaysRequired fields, excluding fields nightshift sets in the patch.
+ado_wit_fields_response_to_required_prompt_json() {
+    local body="${1-}"
+    echo "$body" | jq '[.value[]?
+        | select(.alwaysRequired == true)
+        | select(.referenceName != "System.Title"
+            and .referenceName != "System.Description"
+            and .referenceName != "System.State"
+            and .referenceName != "System.Tags")
+        | {referenceName, name: (.name // .referenceName)}]'
+}
+
+# ado_fetch_wit_required_fields_json <org> <project> <work_item_type_name>
+# Prints JSON array of {referenceName, name} on stdout, or empty array. Errors to stderr; returns non-zero on API failure.
+ado_fetch_wit_required_fields_json() {
+    local org="${1-}" project="${2-}" wit="${3-}"
+    if [[ -z "$org" ]] || [[ -z "$project" ]] || [[ -z "$wit" ]]; then
+        echo "ado_fetch_wit_required_fields_json: org, project, and work item type are required" >&2
+        return 1
+    fi
+    local base enc_project type_seg path resp
+    base="https://dev.azure.com/${org}"
+    enc_project="$(jq -rn --arg p "$project" '$p|@uri')"
+    type_seg="$(ado_uri_encode_wit_type_segment "$wit")"
+    path="${enc_project}/_apis/wit/workitemtypes/${type_seg}/fields"
+    if ! resp="$(ado_api_request "$base" "$path")"; then
+        return 1
+    fi
+    ado_wit_fields_response_to_required_prompt_json "$resp"
+}
+
+# init_normalize_work_item_type_choice <user_input_or_empty>
+# Maps PBI/Bug/Task (any case) or full names to canonical ADO type string.
+init_normalize_work_item_type_choice() {
+    local raw="${1-}"
+    raw="$(echo "$raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    local lower
+    lower="$(echo "$raw" | tr '[:upper:]' '[:lower:]')"
+    case "$lower" in
+        ""|pbi|"product backlog item")
+            echo "Product Backlog Item"
+            ;;
+        bug)
+            echo "Bug"
+            ;;
+        task)
+            echo "Task"
+            ;;
+        *)
+            echo "$raw"
+            ;;
+    esac
+}
+
+# init_ado_repo_fully_configured <repo_config_json> <required_fields_json_array> <work_item_type>
+# Returns 0 if ado_work_item_type matches and ado_fields contains a non-empty string for each required referenceName.
+init_ado_repo_fully_configured() {
+    local cfg="${1-}" required_json="${2-}" wit="${3-}"
+    local saved_type
+    saved_type="$(echo "$cfg" | jq -r '.ado_work_item_type // empty' 2>/dev/null)" || saved_type=""
+    if [[ -z "$saved_type" ]] || [[ "$saved_type" == "null" ]]; then
+        return 1
+    fi
+    if [[ "$saved_type" != "$wit" ]]; then
+        return 1
+    fi
+    if ! echo "$cfg" | jq -e '(.ado_fields | type) == "object"' &>/dev/null; then
+        return 1
+    fi
+    if ! echo "$required_json" | jq -e --argjson c "$cfg" '
+        all(.[]; .referenceName as $r
+            | ($c.ado_fields[$r] // "") as $v
+            | ($v | type == "string") and (($v | length) > 0))
+    ' &>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
 # --- Git operations ---
 
 prepare_repo() {
@@ -1316,15 +1403,155 @@ cmd_run() {
 
 # --- cmd: init ---
 
+# init_prompt_append_gitignore <repo_directory>
+init_prompt_append_gitignore() {
+    local repo_dir="${1-}"
+    local gi="$repo_dir/.gitignore"
+    if [[ -f "$gi" ]] && grep -qE '^[[:space:]]*\.nightshift\.json[[:space:]]*$' "$gi" 2>/dev/null; then
+        return 0
+    fi
+    local ans
+    read -r -p "Add .nightshift.json to .gitignore in $(basename "$repo_dir")? [y/N]: " ans || true
+    if [[ "$ans" == "y" ]] || [[ "$ans" == "Y" ]]; then
+        printf '\n# nightshift local config\n.nightshift.json\n' >> "$gi"
+        echo "  Appended .nightshift.json to $gi"
+    fi
+}
+
+# cmd_init_process_ado_repos <repos_root_expanded> <global_wit_full> <reuse_state_file>
+cmd_init_process_ado_repos() {
+    local repos_root_expanded="${1-}" global_wit_full="${2-}" reuse_state="${3-}"
+    local repos repo_dir
+    repos="$(discover_repos "$repos_root_expanded")"
+
+    echo "Configuring Azure DevOps repositories (.nightshift.json)..."
+    while IFS= read -r repo_dir; do
+        [[ -z "$repo_dir" ]] && continue
+        local repo_name pc pv
+        repo_name="$(basename "$repo_dir")"
+        pc="{}"
+        if [[ -f "$repo_dir/.nightshift.json" ]]; then
+            pc="$(cat "$repo_dir/.nightshift.json")"
+        fi
+        pv="$(detect_provider "$repo_dir" "$pc")"
+        if [[ "$pv" != "azuredevops" ]]; then
+            continue
+        fi
+
+        local meta org project reponame
+        meta="$(resolved_ado_metadata "$repo_dir" "$pc")"
+        org="$(echo "$meta" | jq -r '.org // empty')"
+        project="$(echo "$meta" | jq -r '.project // empty')"
+        reponame="$(echo "$meta" | jq -r '.repo // empty')"
+        if [[ -z "$org" ]] || [[ "$org" == "null" ]] || [[ -z "$project" ]] || [[ "$project" == "null" ]]; then
+            echo "  $repo_name: skip ADO config (could not resolve organization/project from remote or .nightshift.json)"
+            continue
+        fi
+
+        local wit wit_in saved_type
+        saved_type="$(echo "$pc" | jq -r '.ado_work_item_type // empty' 2>/dev/null)" || saved_type=""
+        if [[ -n "$saved_type" ]] && [[ "$saved_type" != "null" ]]; then
+            wit="$saved_type"
+            echo "  $repo_name: work item type (saved): $wit"
+        else
+            read -r -p "  Work item type for $repo_name — PBI, Bug, or Task [$(init_wit_to_short_label "$global_wit_full")]: " wit_in || wit_in=""
+            wit="$(init_normalize_work_item_type_choice "${wit_in:-$global_wit_full}")"
+        fi
+
+        local required_json
+        if ! required_json="$(ado_fetch_wit_required_fields_json "$org" "$project" "$wit")"; then
+            echo "  $repo_name: could not load required fields from Azure DevOps (check type name and permissions); skipping"
+            continue
+        fi
+
+        if init_ado_repo_fully_configured "$pc" "$required_json" "$wit"; then
+            echo "  $repo_name: ADO settings already present; no changes"
+            local subset_fields
+            subset_fields="$(echo "$pc" | jq --argjson req "$required_json" '
+                ($req | map(.referenceName)) as $keys
+                | (.ado_fields // {})
+                | with_entries(select(.key as $k | $keys | index($k) != null))
+            ')"
+            printf '%s\t%s\n' "${org}|${project}|${wit}" "$(echo "$subset_fields" | jq -c .)" >> "$reuse_state"
+            continue
+        fi
+
+        local cache_key reuse_line reuse_json ans_r
+        cache_key="${org}|${project}|${wit}"
+        reuse_json="{}"
+        if [[ -s "$reuse_state" ]]; then
+            reuse_line="$(awk -F'	' -v k="$cache_key" '$1 == k { print $2; exit }' "$reuse_state")"
+            if [[ -n "$reuse_line" ]]; then
+                reuse_json="$reuse_line"
+                read -r -p "  Reuse required field defaults from another repo in ${project} (${wit})? [Y/n]: " ans_r || ans_r=""
+                if [[ -n "$ans_r" ]] && [[ "$ans_r" != "y" ]] && [[ "$ans_r" != "Y" ]]; then
+                    reuse_json="{}"
+                fi
+            fi
+        fi
+
+        local existing_fields
+        existing_fields="$(echo "$pc" | jq '.ado_fields // {}' 2>/dev/null)" || existing_fields="{}"
+
+        local final_fields
+        final_fields="$existing_fields"
+        local idx ref fname val cur prompt_val
+        idx=0
+        local nreq
+        nreq="$(echo "$required_json" | jq 'length' 2>/dev/null)" || nreq="0"
+        while [[ "$idx" -lt "$nreq" ]]; do
+            ref="$(echo "$required_json" | jq -r ".[$idx].referenceName")"
+            fname="$(echo "$required_json" | jq -r ".[$idx].name")"
+            cur="$(echo "$final_fields" | jq -r --arg r "$ref" '.[$r] // empty')"
+            prompt_val=""
+            if [[ -n "$cur" ]] && [[ "$cur" != "null" ]]; then
+                idx=$((idx + 1))
+                continue
+            fi
+            if [[ -n "$reuse_json" ]]; then
+                prompt_val="$(echo "$reuse_json" | jq -r --arg r "$ref" '.[$r] // empty' 2>/dev/null)" || prompt_val=""
+            fi
+            if [[ -z "$prompt_val" ]] || [[ "$prompt_val" == "null" ]]; then
+                read -r -p "    ${fname} (${ref}) [required]: " val || val=""
+                prompt_val="$val"
+            fi
+            if [[ -n "$prompt_val" ]]; then
+                final_fields="$(echo "$final_fields" | jq --arg r "$ref" --arg v "$prompt_val" '. + {($r): $v}')"
+            fi
+            idx=$((idx + 1))
+        done
+
+        local cfg_out cfg_before
+        cfg_before="$(echo "$pc" | jq -c . 2>/dev/null)" || cfg_before="{}"
+        cfg_out="$(echo "$pc" | jq --arg wit "$wit" --argjson fields "$final_fields" \
+            '.ado_work_item_type = $wit | .ado_fields = $fields')"
+
+        if [[ "$cfg_before" == "$(echo "$cfg_out" | jq -c .)" ]]; then
+            echo "  $repo_name: no updates needed"
+            continue
+        fi
+
+        printf '%s\n' "$cfg_out" > "$repo_dir/.nightshift.json"
+        echo "  $repo_name: wrote .nightshift.json"
+
+        printf '%s\t%s\n' "$cache_key" "$(echo "$final_fields" | jq -c .)" >> "$reuse_state"
+
+        init_prompt_append_gitignore "$repo_dir"
+    done <<< "$repos"
+    echo ""
+}
+
+init_wit_to_short_label() {
+    case "${1-}" in
+        "Product Backlog Item") echo "PBI" ;;
+        Bug)                    echo "Bug" ;;
+        Task)                   echo "Task" ;;
+        *)                      echo "${1:-PBI}" ;;
+    esac
+}
+
 cmd_init() {
     echo "nightshift setup"
-    echo ""
-
-    echo "Checking GitHub CLI..."
-    if ! check_gh; then
-        exit 1
-    fi
-    echo "  gh is installed and authenticated"
     echo ""
 
     echo "Detecting AI CLIs..."
@@ -1352,6 +1579,88 @@ cmd_init() {
         exit 1
     fi
     echo ""
+
+    local repos_preview need_github has_ado repo_line pc pv
+    repos_preview="$(discover_repos "$repos_root_expanded")"
+    need_github=false
+    has_ado=false
+    while IFS= read -r repo_line; do
+        [[ -z "$repo_line" ]] && continue
+        pc="{}"
+        if [[ -f "$repo_line/.nightshift.json" ]]; then
+            pc="$(cat "$repo_line/.nightshift.json")"
+        fi
+        pv="$(detect_provider "$repo_line" "$pc")"
+        if [[ "$pv" == "azuredevops" ]]; then
+            has_ado=true
+        else
+            need_github=true
+        fi
+    done <<< "$repos_preview"
+
+    if [[ "$need_github" == true ]]; then
+        echo "Checking GitHub CLI..."
+        if ! check_gh; then
+            exit 1
+        fi
+        echo "  gh is installed and authenticated"
+        echo ""
+    else
+        echo "No GitHub remotes detected under repos root; skipping GitHub CLI check."
+        echo ""
+    fi
+
+    local ado_default_wit_full wit_prompt_default prev_wit
+    ado_default_wit_full="Product Backlog Item"
+    wit_prompt_default="PBI"
+    if [[ "$has_ado" == true ]]; then
+        if ! require_ado_pat; then
+            exit 1
+        fi
+        local org_lines uorg org
+        org_lines=""
+        while IFS= read -r repo_line; do
+            [[ -z "$repo_line" ]] && continue
+            pc="{}"
+            if [[ -f "$repo_line/.nightshift.json" ]]; then
+                pc="$(cat "$repo_line/.nightshift.json")"
+            fi
+            if [[ "$(detect_provider "$repo_line" "$pc")" != "azuredevops" ]]; then
+                continue
+            fi
+            org="$(resolved_ado_metadata "$repo_line" "$pc" | jq -r '.org // empty')"
+            if [[ -n "$org" ]] && [[ "$org" != "null" ]]; then
+                org_lines="${org_lines}${org}"$'\n'
+            fi
+        done <<< "$repos_preview"
+        uorg="$(printf '%s' "$org_lines" | sort -u | sed '/^$/d')"
+        while IFS= read -r org; do
+            [[ -z "$org" ]] && continue
+            if ! check_ado_auth "$org"; then
+                echo "Error: Azure DevOps PAT validation failed for organization '$org'."
+                echo "Set NIGHTSHIFT_ADO_PAT and ensure it can read work items, then run init again."
+                exit 1
+            fi
+        done <<< "$uorg"
+
+        if [[ -f "$CONFIG_FILE" ]]; then
+            prev_wit="$(jq -r '.ado_default_work_item_type // empty' "$CONFIG_FILE" 2>/dev/null)" || prev_wit=""
+            if [[ -n "$prev_wit" ]] && [[ "$prev_wit" != "null" ]]; then
+                ado_default_wit_full="$prev_wit"
+                wit_prompt_default="$(init_wit_to_short_label "$prev_wit")"
+            fi
+        fi
+
+        local wit_g_in
+        echo "Azure DevOps: choose the default work item type for new repos (you can override per repo)."
+        read -r -p "Default work item type (PBI, Bug, Task) [$wit_prompt_default]: " wit_g_in || wit_g_in=""
+        if [[ -n "$wit_g_in" ]]; then
+            ado_default_wit_full="$(init_normalize_work_item_type_choice "$wit_g_in")"
+        else
+            ado_default_wit_full="$(init_normalize_work_item_type_choice "$wit_prompt_default")"
+        fi
+        echo ""
+    fi
 
     local run_hour
     read -r -p "Run time (hour, 0-23) [2]: " run_hour
@@ -1395,38 +1704,64 @@ cmd_init() {
 
     mkdir -p "$NIGHTSHIFT_DIR"
     local config
-    config="$(jq -n \
-        --arg repos_root "$repos_root" \
-        --arg schedule "$schedule" \
-        --argjson agents "$agents_json" \
-        '{repos_root: $repos_root, schedule: $schedule, agents: $agents}')"
+    if [[ "$has_ado" == true ]]; then
+        config="$(jq -n \
+            --arg repos_root "$repos_root" \
+            --arg schedule "$schedule" \
+            --argjson agents "$agents_json" \
+            --arg ado_wit "$ado_default_wit_full" \
+            '{repos_root: $repos_root, schedule: $schedule, agents: $agents, ado_default_work_item_type: $ado_wit}')"
+    else
+        config="$(jq -n \
+            --arg repos_root "$repos_root" \
+            --arg schedule "$schedule" \
+            --argjson agents "$agents_json" \
+            '{repos_root: $repos_root, schedule: $schedule, agents: $agents}')"
+    fi
 
     echo "$config" > "$CONFIG_FILE"
     echo "Config written to $CONFIG_FILE"
     echo ""
 
-    echo "Creating labels in discovered repos..."
-    local repos
-    repos="$(discover_repos "$repos_root_expanded")"
+    if [[ "$need_github" == true ]]; then
+        echo "Creating labels in GitHub repositories..."
+        local repos repo_dir
+        repos="$(discover_repos "$repos_root_expanded")"
 
-    local repo_dir
-    while IFS= read -r repo_dir; do
-        [[ -z "$repo_dir" ]] && continue
-        local repo_name
-        repo_name="$(basename "$repo_dir")"
-        echo "  $repo_name"
+        while IFS= read -r repo_dir; do
+            [[ -z "$repo_dir" ]] && continue
+            local repo_name rcfg prov
+            repo_name="$(basename "$repo_dir")"
+            rcfg="{}"
+            if [[ -f "$repo_dir/.nightshift.json" ]]; then
+                rcfg="$(cat "$repo_dir/.nightshift.json")"
+            fi
+            prov="$(detect_provider "$repo_dir" "$rcfg")"
+            if [[ "$prov" == "azuredevops" ]]; then
+                continue
+            fi
 
-        cd "$repo_dir"
-        gh label create "nightshift" --description "Raised by nightshift" --color "1d1d8a" --force 2>/dev/null || true
+            echo "  $repo_name"
 
-        local agent
-        for agent in $ALL_AGENTS; do
-            local label
-            label="$(get_label "$agent")"
-            gh label create "$label" --force 2>/dev/null || true
-        done
-    done <<< "$repos"
-    echo ""
+            cd "$repo_dir"
+            gh label create "nightshift" --description "Raised by nightshift" --color "1d1d8a" --force 2>/dev/null || true
+
+            local agent
+            for agent in $ALL_AGENTS; do
+                local label
+                label="$(get_label "$agent")"
+                gh label create "$label" --force 2>/dev/null || true
+            done
+        done <<< "$repos"
+        echo ""
+    fi
+
+    if [[ "$has_ado" == true ]]; then
+        local ado_reuse_state
+        ado_reuse_state="$(mktemp)"
+        cmd_init_process_ado_repos "$repos_root_expanded" "$ado_default_wit_full" "$ado_reuse_state"
+        rm -f "$ado_reuse_state"
+    fi
 
     register_cron "$schedule"
 
