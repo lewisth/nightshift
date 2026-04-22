@@ -397,4 +397,33 @@ if ! grep -q "400" "$errdir/errcwi400"; then
   fail "expected HTTP 400 in stderr: $(cat "$errdir/errcwi400")"
 fi
 
+# --- provider dispatch (ADO path) ---
+
+export NIGHTSHIFT_ADO_PAT="test-pat"
+export NIGHTSHIFT_MOCK_HTTP_CODE=200
+export NIGHTSHIFT_MOCK_STATE="$tmp_root/seqdispatch"
+echo 0 > "$NIGHTSHIFT_MOCK_STATE"
+unset NIGHTSHIFT_MOCK_BODY
+out="$(fetch_open_issues_for_repo "$tmp_root/adowiql" '{}')"
+unset NIGHTSHIFT_MOCK_STATE
+if [[ "$out" != $'Alpha\nBeta' ]]; then
+  fail "fetch_open_issues_for_repo ADO: want Alpha/Beta, got: $out"
+fi
+
+export NIGHTSHIFT_MOCK_HTTP_CODE=200
+export NIGHTSHIFT_MOCK_BODY='{"value":[{"title":"D1","description":"X"}]}'
+out="$(fetch_open_prs_for_repo "$tmp_root/adoprs" '{}')"
+unset NIGHTSHIFT_MOCK_BODY
+want=$'PR: D1\nX\n---'
+if [[ "$out" != "$want" ]]; then
+  fail "fetch_open_prs_for_repo ADO: got: $out"
+fi
+
+export NIGHTSHIFT_MOCK_CURL_LOG="$urlog"
+export NIGHTSHIFT_MOCK_HTTP_CODE=200
+export NIGHTSHIFT_MOCK_BODY='{"id":101,"rev":1}'
+if ! ado_bash "$cfg_home" "create_work_item_for_repo \"$tmp_root/adowiql\" '{\"ado_work_item_type\":\"Bug\"}' bugs bugs \"[nightshift] Dispatch\" \"Body\""; then
+  fail "create_work_item_for_repo ADO path should succeed"
+fi
+
 echo "OK: ADO REST tests passed"

@@ -849,6 +849,54 @@ fetch_open_prs() {
         | jq -r '.[] | "PR: \(.title)\n\(.body // "")\n---"' 2>/dev/null || echo "None"
 }
 
+# --- Provider dispatch (per-repo routing) ---
+
+fetch_open_issues_for_repo() {
+    local repo_dir="$1"
+    local repo_config="${2-}"
+    [[ -z "$repo_config" ]] && repo_config="{}"
+
+    local provider
+    provider="$(detect_provider "$repo_dir" "$repo_config")"
+    if [[ "$provider" == "azuredevops" ]]; then
+        fetch_ado_work_items "$repo_dir" "$repo_config"
+    else
+        fetch_open_issues "$repo_dir"
+    fi
+}
+
+fetch_open_prs_for_repo() {
+    local repo_dir="$1"
+    local repo_config="${2-}"
+    [[ -z "$repo_config" ]] && repo_config="{}"
+
+    local provider
+    provider="$(detect_provider "$repo_dir" "$repo_config")"
+    if [[ "$provider" == "azuredevops" ]]; then
+        fetch_ado_prs "$repo_dir" "$repo_config"
+    else
+        fetch_open_prs "$repo_dir"
+    fi
+}
+
+create_work_item_for_repo() {
+    local repo_dir="$1"
+    local repo_config="${2-}"
+    local agent="${3-}"
+    local agent_label="${4-}"
+    local title="${5-}"
+    local body="${6-}"
+    [[ -z "$repo_config" ]] && repo_config="{}"
+
+    local provider
+    provider="$(detect_provider "$repo_dir" "$repo_config")"
+    if [[ "$provider" == "azuredevops" ]]; then
+        create_ado_work_item "$repo_dir" "$repo_config" "$agent" "$title" "$body"
+    else
+        create_github_issue "$repo_dir" "$title" "$agent_label" "$body"
+    fi
+}
+
 is_duplicate() {
     local title="$1"
     local existing_titles="$2"
@@ -877,9 +925,6 @@ process_findings() {
     local existing_titles="$4"
     local repo_config="${5-}"
     [[ -z "$repo_config" ]] && repo_config="{}"
-
-    local provider
-    provider="$(detect_provider "$repo_dir" "$repo_config")"
 
     local json_key agent_label severity_field
     json_key="$(get_json_key "$agent")"
@@ -945,14 +990,8 @@ process_findings() {
 ${description}"
 
         local created_ok=false
-        if [[ "$provider" == "azuredevops" ]]; then
-            if create_ado_work_item "$repo_dir" "$repo_config" "$agent" "$title" "$body"; then
-                created_ok=true
-            fi
-        else
-            if create_github_issue "$repo_dir" "$title" "$agent_label" "$body"; then
-                created_ok=true
-            fi
+        if create_work_item_for_repo "$repo_dir" "$repo_config" "$agent" "$agent_label" "$title" "$body"; then
+            created_ok=true
         fi
         if [[ "$created_ok" == "true" ]]; then
             created=$((created + 1))
@@ -972,10 +1011,6 @@ ${description}"
 cmd_run() {
     log "Starting nightshift run"
 
-    if ! check_gh; then
-        exit 1
-    fi
-
     if [[ -z "$PROMPTS_DIR" ]] || [[ ! -d "$PROMPTS_DIR" ]]; then
         log "Error: Prompts directory not found"
         exit 1
@@ -987,6 +1022,50 @@ cmd_run() {
     local repos repo_count
     repos="$(discover_repos "$repos_root")"
     repo_count="$(echo "$repos" | grep -c . 2>/dev/null || echo 0)"
+
+    local need_github=false
+    local ado_orgs_lines=""
+    local repo_dir_scan
+    while IFS= read -r repo_dir_scan; do
+        [[ -z "$repo_dir_scan" ]] && continue
+        local scan_config="{}"
+        if [[ -f "$repo_dir_scan/.nightshift.json" ]]; then
+            scan_config="$(cat "$repo_dir_scan/.nightshift.json")"
+        fi
+        local scan_provider
+        scan_provider="$(detect_provider "$repo_dir_scan" "$scan_config")"
+        if [[ "$scan_provider" == "azuredevops" ]]; then
+            local scan_org
+            scan_org="$(resolved_ado_metadata "$repo_dir_scan" "$scan_config" | jq -r '.org // empty')"
+            if [[ -z "$scan_org" ]] || [[ "$scan_org" == "null" ]]; then
+                log "Error: Azure DevOps provider for $(basename "$repo_dir_scan") but organization could not be resolved (check git remote and .nightshift.json ado_org)."
+                exit 1
+            fi
+            ado_orgs_lines="${ado_orgs_lines}${scan_org}"$'\n'
+        else
+            need_github=true
+        fi
+    done <<< "$repos"
+
+    if [[ "$need_github" == true ]]; then
+        if ! check_gh; then
+            exit 1
+        fi
+    fi
+
+    if [[ -n "$ado_orgs_lines" ]]; then
+        if ! require_ado_pat; then
+            exit 1
+        fi
+        local ado_org
+        while IFS= read -r ado_org; do
+            [[ -z "$ado_org" ]] && continue
+            if ! check_ado_auth "$ado_org"; then
+                exit 1
+            fi
+        done <<< "$(printf '%s' "$ado_orgs_lines" | sort -u)"
+    fi
+
     log "Scanning $repo_count repos in $repos_root"
 
     local repo_dir
@@ -1002,20 +1081,11 @@ cmd_run() {
             repo_config="$(cat "$repo_dir/.nightshift.json")"
         fi
 
-        local provider existing_titles
-        provider="$(detect_provider "$repo_dir" "$repo_config")"
-        if [[ "$provider" == "azuredevops" ]]; then
-            existing_titles="$(fetch_ado_work_items "$repo_dir" "$repo_config")"
-        else
-            existing_titles="$(fetch_open_issues "$repo_dir")"
-        fi
+        local existing_titles
+        existing_titles="$(fetch_open_issues_for_repo "$repo_dir" "$repo_config")"
 
         local open_prs
-        if [[ "$provider" == "azuredevops" ]]; then
-            open_prs="$(fetch_ado_prs "$repo_dir" "$repo_config")"
-        else
-            open_prs="$(fetch_open_prs "$repo_dir")"
-        fi
+        open_prs="$(fetch_open_prs_for_repo "$repo_dir" "$repo_config")"
 
         local agent
         for agent in $ALL_AGENTS; do
