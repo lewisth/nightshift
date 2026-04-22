@@ -1570,6 +1570,63 @@ cmd_status() {
     fi
     echo ""
 
+    echo "Azure DevOps:"
+    if [[ -z "${NIGHTSHIFT_ADO_PAT:-}" ]]; then
+        echo "  [--] PAT (not set)"
+    else
+        local status_rr ado_cnt ado_org_lines uorg pat_all_ok _rd _cfg _pv _org
+        status_rr=""
+        ado_cnt=0
+        ado_org_lines=""
+        if [[ -f "$CONFIG_FILE" ]]; then
+            status_rr="$(get_repos_root 2>/dev/null)" || status_rr=""
+            if [[ -n "$status_rr" ]] && [[ -d "$status_rr" ]]; then
+                while IFS= read -r _rd; do
+                    [[ -z "$_rd" ]] && continue
+                    _cfg="{}"
+                    if [[ -f "$_rd/.nightshift.json" ]]; then
+                        _cfg="$(cat "$_rd/.nightshift.json")"
+                    fi
+                    _pv="$(detect_provider "$_rd" "$_cfg")"
+                    if [[ "$_pv" == "azuredevops" ]]; then
+                        ado_cnt=$((ado_cnt + 1))
+                        _org="$(resolved_ado_metadata "$_rd" "$_cfg" | jq -r '.org // empty')"
+                        if [[ -n "$_org" ]] && [[ "$_org" != "null" ]]; then
+                            ado_org_lines="${ado_org_lines}${_org}"$'\n'
+                        fi
+                    fi
+                done <<< "$(discover_repos "$status_rr")"
+            fi
+        fi
+
+        uorg=""
+        if [[ -n "$ado_org_lines" ]]; then
+            uorg="$(printf '%s' "$ado_org_lines" | sort -u | sed '/^$/d')"
+        fi
+
+        if [[ "$ado_cnt" -eq 0 ]]; then
+            echo "  [ok] PAT (set)"
+        elif [[ -z "$uorg" ]]; then
+            echo "  [--] PAT (invalid)"
+        else
+            pat_all_ok=true
+            while IFS= read -r _org; do
+                [[ -z "$_org" ]] && continue
+                if ! check_ado_auth "$_org" &>/dev/null; then
+                    pat_all_ok=false
+                    break
+                fi
+            done <<< "$uorg"
+            if [[ "$pat_all_ok" == "true" ]]; then
+                echo "  [ok] PAT (valid)"
+            else
+                echo "  [--] PAT (invalid)"
+            fi
+        fi
+        echo "  ADO repos: $ado_cnt"
+    fi
+    echo ""
+
     echo "Schedule:"
     local cron_schedule
     cron_schedule="$(get_cron_schedule)"

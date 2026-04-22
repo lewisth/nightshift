@@ -450,4 +450,35 @@ if [[ -n "$out" ]]; then
   fail "non-strict 503 should yield empty titles"
 fi
 
+# --- cmd_status Azure DevOps section ---
+
+status_home="$tmp_root/statushome"
+repos_base="$tmp_root/status_repos"
+mkdir -p "$status_home/.nightshift" "$repos_base"
+mkrepo "$repos_base/ado1" 'https://dev.azure.com/contoso/Fabrikam/_git/R1'
+mkrepo "$repos_base/gh1" 'https://github.com/a/b.git'
+jq -n --arg rr "$repos_base" \
+  '{repos_root: $rr, schedule: "0 2 * * *", agents: {}}' > "$status_home/.nightshift/config.json"
+
+export NIGHTSHIFT_MOCK_HTTP_CODE=200
+unset NIGHTSHIFT_MOCK_BODY NIGHTSHIFT_MOCK_STATE
+export NIGHTSHIFT_ADO_PAT="test-pat"
+out="$(ado_bash "$status_home" 'unset NIGHTSHIFT_MOCK_BODY; cmd_status')"
+echo "$out" | grep -Fq "Azure DevOps:" || fail "status: missing Azure DevOps header"
+echo "$out" | grep -Fq "[ok] PAT (valid)" || fail "status: want valid PAT, got: $out"
+echo "$out" | grep -Fq "ADO repos: 1" || fail "status: want 1 ADO repo, got: $out"
+
+out="$(ado_bash "$status_home" 'unset NIGHTSHIFT_ADO_PAT NIGHTSHIFT_MOCK_BODY; cmd_status')"
+echo "$out" | grep -Fq "[--] PAT (not set)" || fail "status: PAT not set line missing"
+if echo "$out" | grep -Fq "ADO repos:"; then
+  fail "status: should not show ADO repos when PAT unset"
+fi
+
+export NIGHTSHIFT_ADO_PAT="test-pat"
+export NIGHTSHIFT_MOCK_HTTP_CODE=401
+export NIGHTSHIFT_MOCK_BODY='{"message":"not authorized"}'
+out="$(ado_bash "$status_home" 'cmd_status')"
+unset NIGHTSHIFT_MOCK_BODY
+echo "$out" | grep -Fq "[--] PAT (invalid)" || fail "status: want invalid PAT, got: $out"
+
 echo "OK: ADO REST tests passed"
