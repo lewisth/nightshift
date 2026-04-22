@@ -426,4 +426,28 @@ if ! ado_bash "$cfg_home" "create_work_item_for_repo \"$tmp_root/adowiql\" '{\"a
   fail "create_work_item_for_repo ADO path should succeed"
 fi
 
+# --- NIGHTSHIFT_ADO_STRICT (cmd_run treats ADO fetch failure as non-zero) ---
+
+export NIGHTSHIFT_ADO_PAT="test-pat"
+export NIGHTSHIFT_ADO_STRICT=1
+unset NIGHTSHIFT_ADO_PAT
+if out="$(fetch_ado_work_items "$tmp_root/x" '{}')"; then
+  fail "strict: missing PAT should fail fetch_ado_work_items"
+fi
+export NIGHTSHIFT_ADO_PAT="test-pat"
+export NIGHTSHIFT_MOCK_HTTP_CODE=503
+unset NIGHTSHIFT_MOCK_STATE
+if out="$(fetch_ado_work_items "$tmp_root/adowiql" '{}')"; then
+  fail "strict: HTTP 503 should fail fetch_ado_work_items"
+fi
+unset NIGHTSHIFT_ADO_STRICT
+
+export NIGHTSHIFT_MOCK_HTTP_CODE=503
+if ! out="$(fetch_ado_work_items "$tmp_root/adowiql" '{}')"; then
+  fail "non-strict: fetch_ado_work_items should return 0 on 503 with empty titles"
+fi
+if [[ -n "$out" ]]; then
+  fail "non-strict 503 should yield empty titles"
+fi
+
 echo "OK: ADO REST tests passed"
