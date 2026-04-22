@@ -5,7 +5,7 @@ Nightly automated code auditing that runs while you sleep. Nightshift scans your
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lewisharper/nightshift/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/lewisth/nightshift/main/install.sh | bash
 ```
 
 This places the `nightshift` script in `~/.local/bin/` and the agent prompts in `~/.local/share/nightshift/prompts/`.
@@ -132,13 +132,13 @@ Run logs are written to `~/.nightshift/logs/YYYY-MM-DD.log` with timestamped ent
 ## Uninstalling
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lewisharper/nightshift/main/uninstall.sh | bash -s -- -y
+curl -fsSL https://raw.githubusercontent.com/lewisth/nightshift/main/uninstall.sh | bash -s -- -y
 ```
 
 Or, if you want an interactive confirmation prompt:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lewisharper/nightshift/main/uninstall.sh -o uninstall.sh
+curl -fsSL https://raw.githubusercontent.com/lewisth/nightshift/main/uninstall.sh -o uninstall.sh
 bash uninstall.sh
 ```
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="lewisharper/nightshift"
+REPO="lewisth/nightshift"
 BRANCH="main"
 INSTALL_DIR="$HOME/.local/bin"
 SHARE_DIR="$HOME/.local/share/nightshift"
