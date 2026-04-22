@@ -21,10 +21,18 @@ while [[ $# -gt 0 ]]; do
     -sS) shift ;;
     -o) outf="$2"; shift 2 ;;
     -w) wfmt="$2"; shift 2 ;;
-    -H) shift 2 ;;
+    -H)
+      if [[ -n "${NIGHTSHIFT_MOCK_CURL_HEADERS_LOG:-}" ]]; then
+        printf '%s\n' "$2" >> "$NIGHTSHIFT_MOCK_CURL_HEADERS_LOG"
+      fi
+      shift 2 ;;
     -u) shift 2 ;;
     -X) shift 2 ;;
-    -d|--data-binary) shift 2 ;;
+    -d|--data-binary)
+      if [[ -n "${NIGHTSHIFT_MOCK_CURL_POST_BODY_LOG:-}" ]]; then
+        printf '%s' "$2" > "$NIGHTSHIFT_MOCK_CURL_POST_BODY_LOG"
+      fi
+      shift 2 ;;
     *) pos+=("$1"); shift ;;
   esac
 done
@@ -282,6 +290,111 @@ unset NIGHTSHIFT_MOCK_BODY
 out="$(fetch_ado_prs "$tmp_root/adoprs" '{}')"
 if [[ "$out" != "None" ]]; then
   fail "PR API error should yield None, got: $out"
+fi
+
+# --- create_ado_work_item (fresh HOME so ~/.nightshift/config.json is test-controlled) ---
+
+ado_bash() {
+  local home="$1"
+  local cmd="$2"
+  env HOME="$home" PATH="$tmpbin:$PATH" NIGHTSHIFT_CURL=curl NIGHTSHIFT_SKIP_MAIN=1 \
+    NIGHTSHIFT_MOCK_CURL_LOG="${NIGHTSHIFT_MOCK_CURL_LOG:-}" \
+    NIGHTSHIFT_MOCK_CURL_HEADERS_LOG="${NIGHTSHIFT_MOCK_CURL_HEADERS_LOG:-}" \
+    NIGHTSHIFT_MOCK_CURL_POST_BODY_LOG="${NIGHTSHIFT_MOCK_CURL_POST_BODY_LOG:-}" \
+    NIGHTSHIFT_MOCK_HTTP_CODE="${NIGHTSHIFT_MOCK_HTTP_CODE:-200}" \
+    NIGHTSHIFT_MOCK_BODY="${NIGHTSHIFT_MOCK_BODY:-}" \
+    NIGHTSHIFT_ADO_PAT="${NIGHTSHIFT_ADO_PAT-}" \
+    bash -c 'source "$1" && eval "$2"' _ "$ROOT/nightshift" "$cmd"
+}
+
+cfg_home="$tmp_root/cfghome"
+mkdir -p "$cfg_home/.nightshift"
+printf '%s\n' '{"ado_default_work_item_type":"Task"}' > "$cfg_home/.nightshift/config.json"
+
+cat > "$tmp_root/repo12.json" <<'JSON'
+{
+  "ado_area_path": "Fabrikam\\Area",
+  "ado_iteration_path": "Fabrikam\\Sprint 1",
+  "ado_fields": {"Custom.Required": "value1"}
+}
+JSON
+
+unset NIGHTSHIFT_ADO_PAT
+if ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/adowiql\" \"\$(cat \"$tmp_root/repo12.json\")\" bugs \"[nightshift] T\" \"Body\"" 2>"$errdir/errcwi0"; then
+  fail "create without PAT should fail"
+fi
+if ! grep -q "NIGHTSHIFT_ADO_PAT is not set" "$errdir/errcwi0"; then
+  fail "create missing PAT message: $(cat "$errdir/errcwi0")"
+fi
+
+export NIGHTSHIFT_ADO_PAT="test-pat"
+if ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/ghonly\" \"{}\" bugs \"[nightshift] T\" \"Body\"" 2>"$errdir/errcwi1"; then
+  fail "create without ADO metadata should fail"
+fi
+if ! grep -q "Cannot create Azure DevOps work item" "$errdir/errcwi1"; then
+  fail "expected metadata error: $(cat "$errdir/errcwi1")"
+fi
+
+hdrlog="$(mktemp)"
+bodylog="$(mktemp)"
+urlog="$(mktemp)"
+export NIGHTSHIFT_MOCK_CURL_HEADERS_LOG="$hdrlog"
+export NIGHTSHIFT_MOCK_CURL_POST_BODY_LOG="$bodylog"
+export NIGHTSHIFT_MOCK_CURL_LOG="$urlog"
+export NIGHTSHIFT_MOCK_HTTP_CODE=200
+export NIGHTSHIFT_MOCK_BODY='{"id":99,"rev":1}'
+if ! ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/adowiql\" \"\$(cat \"$tmp_root/repo12.json\")\" bugs \"[nightshift] Hello\" \"\$(printf '%b' 'Line1\\n\\nLine2')\""; then
+  fail "create should succeed with mock 200"
+fi
+if ! grep -q 'application/json-patch+json' "$hdrlog"; then
+  fail "expected Content-Type json-patch+json in headers, got: $(cat "$hdrlog")"
+fi
+uwi="$(cat "$urlog")"
+if [[ "$uwi" != *"workitems/%24Task"* ]] && [[ "$uwi" != *'workitems/$Task'* ]]; then
+  fail "expected workitems \$Task in URL (global default), got: $uwi"
+fi
+patch_body="$(cat "$bodylog")"
+if ! echo "$patch_body" | jq -e . >/dev/null; then
+  fail "patch not JSON: $patch_body"
+fi
+if [[ "$(echo "$patch_body" | jq -r '.[] | select(.path=="/fields/System.Title") | .value')" != "[nightshift] Hello" ]]; then
+  fail "patch title: $patch_body"
+fi
+if [[ "$(echo "$patch_body" | jq -r '.[] | select(.path=="/fields/System.Description") | .value')" != $'Line1\n\nLine2' ]]; then
+  fail "patch description markdown"
+fi
+tags_val="$(echo "$patch_body" | jq -r '.[] | select(.path=="/fields/System.Tags") | .value')"
+if [[ "$tags_val" != *"nightshift"* ]] || [[ "$tags_val" != *"bug"* ]] || [[ "$tags_val" != *"nightshift-repo:FabrikamFiber"* ]]; then
+  fail "patch tags: $tags_val"
+fi
+if [[ "$(echo "$patch_body" | jq -r '.[] | select(.path=="/fields/System.AreaPath") | .value')" != 'Fabrikam\Area' ]]; then
+  fail "patch area path"
+fi
+if [[ "$(echo "$patch_body" | jq -r '.[] | select(.path=="/fields/System.IterationPath") | .value')" != 'Fabrikam\Sprint 1' ]]; then
+  fail "patch iteration path"
+fi
+if [[ "$(echo "$patch_body" | jq -r '.[] | select(.path=="/fields/Custom.Required") | .value')" != 'value1' ]]; then
+  fail "patch ado_fields"
+fi
+
+export NIGHTSHIFT_MOCK_CURL_LOG="$urlog"
+export NIGHTSHIFT_MOCK_HTTP_CODE=200
+export NIGHTSHIFT_MOCK_BODY='{"id":100,"rev":1}'
+if ! ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/adowiql\" '{\"ado_work_item_type\":\"Bug\"}' bugs \"[nightshift] X\" \"D\""; then
+  fail "create Bug type failed"
+fi
+uwi2="$(cat "$urlog")"
+if [[ "$uwi2" != *"%24Bug"* ]] && [[ "$uwi2" != *'$Bug'* ]]; then
+  fail "repo ado_work_item_type should override global Task: $uwi2"
+fi
+
+export NIGHTSHIFT_MOCK_HTTP_CODE=400
+export NIGHTSHIFT_MOCK_BODY='{"message":"invalid patch"}'
+if ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/adowiql\" \"{}\" bugs \"[nightshift] Z\" \"D\"" 2>"$errdir/errcwi400"; then
+  fail "HTTP 400 should fail create"
+fi
+if ! grep -q "400" "$errdir/errcwi400"; then
+  fail "expected HTTP 400 in stderr: $(cat "$errdir/errcwi400")"
 fi
 
 echo "OK: ADO REST tests passed"
