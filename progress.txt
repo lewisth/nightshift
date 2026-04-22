@@ -2,4 +2,4 @@
 # Repo: lewisth/nightshift
 # Started: 2026-04-22T20:28:00Z
 
-#8 (2026-04-22): Added strip_remote_credentials, parse_ado_remote (four ADO URL shapes), detect_provider (origin + .nightshift.json provider override), and resolved_ado_metadata (ado_* overrides). Extended status to list each repo’s provider; NIGHTSHIFT_SKIP_MAIN for tests. Tests: tests/run_provider_tests.sh.
+#8 (2026-04-22): Added strip_remote_credentials, parse_ado_remote (four ADO URL shapes), detect_provider (origin + .nightshift.json provider override), and resolved_ado_metadata (ado_* overrides). Extended status to list each repo’s provider; NIGHTSHIFT_SKIP_MAIN for tests. Tests: tests/run_provider_tests.sh. Push to main blocked (branch protection); pushed branch fix/issue-8-provider-detection for PR.
