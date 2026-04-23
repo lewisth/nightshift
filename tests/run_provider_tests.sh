@@ -103,4 +103,37 @@ assert_json_eq org x "$meta"
 assert_json_eq project y "$meta"
 assert_json_eq repo z "$meta"
 
+# --- provider dispatch (GitHub path via gh stub) ---
+
+tmpbin="$tmp/bin"
+mkdir -p "$tmpbin"
+cat > "$tmpbin/gh" <<'GHMOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+c="$*"
+if [[ "$c" == *"issue list"* ]]; then
+  echo '[{"title":"GH Issue One"}]'
+elif [[ "$c" == *"pr list"* ]]; then
+  echo '[{"title":"GH PR","body":"PR body here"}]'
+elif [[ "$c" == *"issue create"* ]]; then
+  echo 'https://github.com/acme/widget/issues/42'
+else
+  echo "gh stub: unexpected: $c" >&2
+  exit 1
+fi
+GHMOCK
+chmod +x "$tmpbin/gh"
+PATH="$tmpbin:$PATH"
+
+out="$(fetch_open_issues_for_repo "$tmp/gh" '{}')"
+[[ "$out" == "GH Issue One" ]] || fail "fetch_open_issues_for_repo github: $out"
+
+out="$(fetch_open_prs_for_repo "$tmp/gh" '{}')"
+want=$'PR: GH PR\nPR body here\n---'
+[[ "$out" == "$want" ]] || fail "fetch_open_prs_for_repo github: $out"
+
+if ! create_work_item_for_repo "$tmp/gh" '{}' bugs bugs "[nightshift] T" "B"; then
+  fail "create_work_item_for_repo github path should succeed"
+fi
+
 echo "OK: provider detection tests passed"

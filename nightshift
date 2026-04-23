@@ -29,6 +29,83 @@ log() {
     echo "[$timestamp] $*"
 }
 
+# cmd_run: categorised error buckets (tab-separated "repo\tdetail" per line; detail may contain internal tabs)
+RUN_ERR_AUTH_LINES=""
+RUN_ERR_API_LINES=""
+RUN_ERR_PARSE_LINES=""
+RUN_ERR_CLI_LINES=""
+
+record_run_error() {
+    local kind="$1"
+    local repo="$2"
+    local detail="$3"
+    local line
+    line="${repo}"$'\t'"${detail}"
+    case "$kind" in
+        auth)  RUN_ERR_AUTH_LINES="${RUN_ERR_AUTH_LINES}${line}"$'\n' ;;
+        api)   RUN_ERR_API_LINES="${RUN_ERR_API_LINES}${line}"$'\n' ;;
+        parse) RUN_ERR_PARSE_LINES="${RUN_ERR_PARSE_LINES}${line}"$'\n' ;;
+        cli)   RUN_ERR_CLI_LINES="${RUN_ERR_CLI_LINES}${line}"$'\n' ;;
+    esac
+}
+
+# Read stderr from ADO fetch helpers; record auth or api.
+record_run_error_from_ado_log() {
+    local repo_name="$1"
+    local err_file="${2-}"
+    local text
+    text="$(cat "$err_file" 2>/dev/null || true)"
+    if echo "$text" | grep -qE "Failed to parse|not valid JSON|non-JSON response|empty body"; then
+        local one
+        one="$(echo "$text" | tr '\n' ' ' | sed 's/  */ /g')"
+        one="${one:0:400}"
+        record_run_error api "$repo_name" "$one"
+        return
+    fi
+    if [[ -z "$text" ]]; then
+        record_run_error api "$repo_name" "Missing or incomplete Azure DevOps metadata (organization, project, or repository)"
+        return
+    fi
+    if echo "$text" | grep -q "NIGHTSHIFT_ADO_PAT is not set"; then
+        record_run_error auth "$repo_name" "NIGHTSHIFT_ADO_PAT is not set (Azure DevOps)"
+        return
+    fi
+    if echo "$text" | grep -qE "rejected the personal access token|HTTP 401|not authenticated"; then
+        record_run_error auth "$repo_name" "Azure DevOps authentication failed (PAT invalid or expired; HTTP 401)"
+        return
+    fi
+    local one
+    one="$(echo "$text" | tr '\n' ' ' | sed 's/  */ /g')"
+    one="${one:0:400}"
+    [[ -z "$one" ]] && one="Azure DevOps API request failed"
+    record_run_error api "$repo_name" "$one"
+}
+
+emit_run_error_summary() {
+    if [[ -z "$RUN_ERR_AUTH_LINES" && -z "$RUN_ERR_API_LINES" && -z "$RUN_ERR_PARSE_LINES" && -z "$RUN_ERR_CLI_LINES" ]]; then
+        return 0
+    fi
+    log "Error summary:"
+    local section
+    for section in "Auth errors|RUN_ERR_AUTH_LINES" "API errors|RUN_ERR_API_LINES" "Parse errors|RUN_ERR_PARSE_LINES" "CLI errors|RUN_ERR_CLI_LINES"; do
+        local name="${section%%|*}"
+        local varname="${section#*|}"
+        local lines
+        lines="${!varname}"
+        if [[ -z "$lines" ]]; then
+            continue
+        fi
+        log "  $name"
+        while IFS= read -r eline; do
+            [[ -z "$eline" ]] && continue
+            local r d
+            r="${eline%%$'\t'*}"
+            d="${eline#*$'\t'}"
+            log "    $r: $d"
+        done <<< "$lines"
+    done
+}
+
 # --- Agent metadata ---
 
 get_json_key() {
@@ -304,6 +381,632 @@ resolved_ado_metadata() {
         '
 }
 
+# --- Azure DevOps REST (api-version=7.1) ---
+
+# Ensures NIGHTSHIFT_ADO_PAT is set. Prints to stderr and returns 1 if missing.
+require_ado_pat() {
+    if [[ -z "${NIGHTSHIFT_ADO_PAT:-}" ]]; then
+        echo "Error: NIGHTSHIFT_ADO_PAT is not set. Set this environment variable to an Azure DevOps personal access token (PAT) with access to the organization you use with nightshift." >&2
+        return 1
+    fi
+    return 0
+}
+
+# Internal: GET request with Basic auth. Override NIGHTSHIFT_CURL in tests (must support curl CLI).
+_nightshift_ado_curl() {
+    "${NIGHTSHIFT_CURL:-curl}" "$@"
+}
+
+# ado_api_request <ado_root_url> <path>
+# ado_root_url: e.g. https://dev.azure.com/myorg (no trailing slash)
+# path: API path, optional query (e.g. _apis/projects?%24top=1)
+# On success, prints the JSON body (validated) to stdout. On failure, prints a clear error to stderr.
+ado_api_request() {
+    if ! require_ado_pat; then
+        return 1
+    fi
+    local base="${1-}" path="${2-}"
+    if [[ -z "$base" ]] || [[ -z "$path" ]]; then
+        echo "ado_api_request: usage: ado_api_request <ado_root_url> <path>" >&2
+        return 1
+    fi
+    path="${path#/}"
+    local apath
+    if [[ "$path" == *"?"* ]]; then
+        apath="${path}&api-version=7.1"
+    else
+        apath="${path}?api-version=7.1"
+    fi
+    local url="${base%/}/${apath}"
+
+    local tmp
+    tmp="$(mktemp)"
+    local http_code
+    if ! http_code="$(_nightshift_ado_curl -sS -o "$tmp" -w '%{http_code}' \
+        -H "Accept: application/json" \
+        -u ":$NIGHTSHIFT_ADO_PAT" \
+        "$url")"; then
+        rm -f "$tmp"
+        echo "Error: Network request to Azure DevOps failed (connection or TLS error). Check your network and that the URL is correct: $url" >&2
+        return 1
+    fi
+
+    local body
+    body="$(cat "$tmp" 2>/dev/null || true)"
+    rm -f "$tmp"
+
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        if [[ -z "$body" ]]; then
+            echo "Error: Azure DevOps returned an empty body (HTTP $http_code)." >&2
+            return 1
+        fi
+        if ! echo "$body" | jq -e . &>/dev/null; then
+            echo "Error: Azure DevOps returned a non-JSON response (HTTP $http_code). Body was not valid JSON." >&2
+            return 1
+        fi
+        echo "$body" | jq .
+        return 0
+    fi
+
+    local detail=""
+    if [[ -n "$body" ]] && echo "$body" | jq -e . &>/dev/null; then
+        detail="$(echo "$body" | jq -r '(.message // .value // .) | if type == "string" then . else tostring end' 2>/dev/null)" || detail=""
+    fi
+    if [[ -n "$detail" ]] && [[ "$detail" != "null" ]]; then
+        detail=" $detail"
+    else
+        detail=""
+    fi
+
+    case "$http_code" in
+        401)
+            echo "Error: Azure DevOps rejected the personal access token (HTTP 401).${detail} — Verify that NIGHTSHIFT_ADO_PAT is correct, not expired, and has the required API scopes (e.g. code read) for the target organization." >&2
+            ;;
+        403)
+            echo "Error: Access denied to Azure DevOps (HTTP 403).${detail} — The token may be valid but lacks permission for this resource, or a policy is blocking the request." >&2
+            ;;
+        404)
+            echo "Error: Azure DevOps resource not found (HTTP 404).${detail} — Check the organization name, collection URL, and API path. If the organization or project was renamed or does not exist, the URL will not resolve." >&2
+            ;;
+        500|501|502|503|504)
+            echo "Error: Azure DevOps service error (HTTP $http_code).${detail} — Try again later; the service or your organization may be temporarily unavailable." >&2
+            ;;
+        *)
+            echo "Error: Azure DevOps request failed (HTTP $http_code).${detail} — $url" >&2
+            ;;
+    esac
+    return 1
+}
+
+# ado_api_post_request <ado_root_url> <path> <json_body>
+# POST with Content-Type application/json. Same success/error behavior as ado_api_request.
+ado_api_post_request() {
+    if ! require_ado_pat; then
+        return 1
+    fi
+    local base="${1-}" path="${2-}" body="${3-}"
+    if [[ -z "$base" ]] || [[ -z "$path" ]] || [[ -z "$body" ]]; then
+        echo "ado_api_post_request: usage: ado_api_post_request <ado_root_url> <path> <json_body>" >&2
+        return 1
+    fi
+    path="${path#/}"
+    local apath
+    if [[ "$path" == *"?"* ]]; then
+        apath="${path}&api-version=7.1"
+    else
+        apath="${path}?api-version=7.1"
+    fi
+    local url="${base%/}/${apath}"
+
+    local tmp
+    tmp="$(mktemp)"
+    local http_code
+    if ! http_code="$(_nightshift_ado_curl -sS -o "$tmp" -w '%{http_code}' \
+        -H "Accept: application/json" \
+        -H "Content-Type: application/json; charset=utf-8" \
+        -u ":$NIGHTSHIFT_ADO_PAT" \
+        -X POST \
+        -d "$body" \
+        "$url")"; then
+        rm -f "$tmp"
+        echo "Error: Network request to Azure DevOps failed (connection or TLS error). Check your network and that the URL is correct: $url" >&2
+        return 1
+    fi
+
+    local resp
+    resp="$(cat "$tmp" 2>/dev/null || true)"
+    rm -f "$tmp"
+
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        if [[ -z "$resp" ]]; then
+            echo "Error: Azure DevOps returned an empty body (HTTP $http_code)." >&2
+            return 1
+        fi
+        if ! echo "$resp" | jq -e . &>/dev/null; then
+            echo "Error: Azure DevOps returned a non-JSON response (HTTP $http_code). Body was not valid JSON." >&2
+            return 1
+        fi
+        echo "$resp" | jq .
+        return 0
+    fi
+
+    local detail=""
+    if [[ -n "$resp" ]] && echo "$resp" | jq -e . &>/dev/null; then
+        detail="$(echo "$resp" | jq -r '(.message // .value // .) | if type == "string" then . else tostring end' 2>/dev/null)" || detail=""
+    fi
+    if [[ -n "$detail" ]] && [[ "$detail" != "null" ]]; then
+        detail=" $detail"
+    else
+        detail=""
+    fi
+
+    case "$http_code" in
+        401)
+            echo "Error: Azure DevOps rejected the personal access token (HTTP 401).${detail} — Verify that NIGHTSHIFT_ADO_PAT is correct, not expired, and has the required API scopes (e.g. code read) for the target organization." >&2
+            ;;
+        403)
+            echo "Error: Access denied to Azure DevOps (HTTP 403).${detail} — The token may be valid but lacks permission for this resource, or a policy is blocking the request." >&2
+            ;;
+        404)
+            echo "Error: Azure DevOps resource not found (HTTP 404).${detail} — Check the organization name, collection URL, and API path. If the organization or project was renamed or does not exist, the URL will not resolve." >&2
+            ;;
+        500|501|502|503|504)
+            echo "Error: Azure DevOps service error (HTTP $http_code).${detail} — Try again later; the service or your organization may be temporarily unavailable." >&2
+            ;;
+        *)
+            echo "Error: Azure DevOps request failed (HTTP $http_code).${detail} — $url" >&2
+            ;;
+    esac
+    return 1
+}
+
+# ado_api_json_patch_post_request <ado_root_url> <path> <json_patch_body>
+# POST with Content-Type application/json-patch+json (work item create/update).
+ado_api_json_patch_post_request() {
+    if ! require_ado_pat; then
+        return 1
+    fi
+    local base="${1-}" path="${2-}" body="${3-}"
+    if [[ -z "$base" ]] || [[ -z "$path" ]] || [[ -z "$body" ]]; then
+        echo "ado_api_json_patch_post_request: usage: ado_api_json_patch_post_request <ado_root_url> <path> <json_patch_body>" >&2
+        return 1
+    fi
+    path="${path#/}"
+    local apath
+    if [[ "$path" == *"?"* ]]; then
+        apath="${path}&api-version=7.1"
+    else
+        apath="${path}?api-version=7.1"
+    fi
+    local url="${base%/}/${apath}"
+
+    local tmp
+    tmp="$(mktemp)"
+    local http_code
+    if ! http_code="$(_nightshift_ado_curl -sS -o "$tmp" -w '%{http_code}' \
+        -H "Accept: application/json" \
+        -H "Content-Type: application/json-patch+json" \
+        -u ":$NIGHTSHIFT_ADO_PAT" \
+        -X POST \
+        -d "$body" \
+        "$url")"; then
+        rm -f "$tmp"
+        echo "Error: Network request to Azure DevOps failed (connection or TLS error). Check your network and that the URL is correct: $url" >&2
+        return 1
+    fi
+
+    local resp
+    resp="$(cat "$tmp" 2>/dev/null || true)"
+    rm -f "$tmp"
+
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        if [[ -z "$resp" ]]; then
+            echo "Error: Azure DevOps returned an empty body (HTTP $http_code)." >&2
+            return 1
+        fi
+        if ! echo "$resp" | jq -e . &>/dev/null; then
+            echo "Error: Azure DevOps returned a non-JSON response (HTTP $http_code). Body was not valid JSON." >&2
+            return 1
+        fi
+        echo "$resp" | jq .
+        return 0
+    fi
+
+    local detail=""
+    if [[ -n "$resp" ]] && echo "$resp" | jq -e . &>/dev/null; then
+        detail="$(echo "$resp" | jq -r '(.message // .value // .) | if type == "string" then . else tostring end' 2>/dev/null)" || detail=""
+    fi
+    if [[ -n "$detail" ]] && [[ "$detail" != "null" ]]; then
+        detail=" $detail"
+    else
+        detail=""
+    fi
+
+    case "$http_code" in
+        401)
+            echo "Error: Azure DevOps rejected the personal access token (HTTP 401).${detail} — Verify that NIGHTSHIFT_ADO_PAT is correct, not expired, and has the required API scopes (e.g. code read) for the target organization." >&2
+            ;;
+        403)
+            echo "Error: Access denied to Azure DevOps (HTTP 403).${detail} — The token may be valid but lacks permission for this resource, or a policy is blocking the request." >&2
+            ;;
+        404)
+            echo "Error: Azure DevOps resource not found (HTTP 404).${detail} — Check the organization name, collection URL, and API path. If the organization or project was renamed or does not exist, the URL will not resolve." >&2
+            ;;
+        500|501|502|503|504)
+            echo "Error: Azure DevOps service error (HTTP $http_code).${detail} — Try again later; the service or your organization may be temporarily unavailable." >&2
+            ;;
+        *)
+            echo "Error: Azure DevOps request failed (HTTP $http_code).${detail} — $url" >&2
+            ;;
+    esac
+    return 1
+}
+
+# create_ado_work_item <repo_dir> <repo_config_json> <agent> <title> <description_markdown>
+# Creates a work item via JSON Patch. Title should include the [nightshift] prefix (same as GitHub issues).
+# Returns 0 on success. Logs errors to stderr and returns non-zero on failure.
+create_ado_work_item() {
+    local repo_dir="$1"
+    local repo_config="${2-}"
+    local agent="${3-}"
+    local title="${4-}"
+    local description="${5-}"
+    [[ -z "$repo_config" ]] && repo_config="{}"
+
+    if ! require_ado_pat; then
+        return 1
+    fi
+
+    local meta org project repo
+    meta="$(resolved_ado_metadata "$repo_dir" "$repo_config")"
+    org="$(echo "$meta" | jq -r '.org // empty')"
+    project="$(echo "$meta" | jq -r '.project // empty')"
+    repo="$(echo "$meta" | jq -r '.repo // empty')"
+
+    if [[ -z "$org" ]] || [[ -z "$project" ]] || [[ -z "$repo" ]] || [[ "$org" == "null" ]]; then
+        echo "Error: Cannot create Azure DevOps work item: missing organization, project, or repository (check git remote and .nightshift.json ado_* fields)." >&2
+        return 1
+    fi
+
+    local wit_type global_default
+    wit_type="$(echo "$repo_config" | jq -r '.ado_work_item_type // empty' 2>/dev/null)"
+    global_default=""
+    if [[ -f "$CONFIG_FILE" ]]; then
+        global_default="$(jq -r '.ado_default_work_item_type // empty' "$CONFIG_FILE" 2>/dev/null)" || global_default=""
+    fi
+    if [[ -z "$wit_type" ]] || [[ "$wit_type" == "null" ]]; then
+        wit_type="$global_default"
+    fi
+    if [[ -z "$wit_type" ]] || [[ "$wit_type" == "null" ]]; then
+        wit_type="Product Backlog Item"
+    fi
+
+    local agent_label area_path iteration_path
+    agent_label="$(get_label "$agent")"
+    area_path="$(echo "$repo_config" | jq -r '.ado_area_path // empty' 2>/dev/null)"
+    iteration_path="$(echo "$repo_config" | jq -r '.ado_iteration_path // empty' 2>/dev/null)"
+    [[ "$area_path" == "null" ]] && area_path=""
+    [[ "$iteration_path" == "null" ]] && iteration_path=""
+
+    local tags="nightshift,${agent_label},nightshift-repo:${repo}"
+
+    local ado_fields_json
+    ado_fields_json="$(echo "$repo_config" | jq '.ado_fields // {}' 2>/dev/null)" || ado_fields_json="{}"
+
+    local patch
+    if ! patch="$(jq -n \
+        --arg title "$title" \
+        --arg desc "$description" \
+        --arg tags "$tags" \
+        --arg area "$area_path" \
+        --arg iter "$iteration_path" \
+        --argjson fields "$ado_fields_json" \
+        '
+        [
+            {"op":"add","path":"/fields/System.Title","value":$title},
+            {"op":"add","path":"/fields/System.Description","value":$desc},
+            {"op":"add","path":"/fields/System.Tags","value":$tags}
+        ]
+        + (if ($area | length) > 0 then [{"op":"add","path":"/fields/System.AreaPath","value":$area}] else [] end)
+        + (if ($iter | length) > 0 then [{"op":"add","path":"/fields/System.IterationPath","value":$iter}] else [] end)
+        + ($fields | to_entries | map({op:"add", path: ("/fields/" + .key), value: .value}))
+        ')"; then
+        echo "Error: Failed to build Azure DevOps work item JSON Patch document." >&2
+        return 1
+    fi
+
+    local base enc_project type_seg wi_path
+    base="https://dev.azure.com/${org}"
+    enc_project="$(jq -rn --arg p "$project" '$p|@uri')"
+    type_seg="$(jq -rn --arg t "$wit_type" '"$" + ($t|@uri)')"
+    wi_path="${enc_project}/_apis/wit/workitems/${type_seg}"
+
+    if ! ado_api_json_patch_post_request "$base" "$wi_path" "$patch" >/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
+# _ado_fetch_work_item_titles <ado_base> <uri_encoded_project> <comma_separated_ids>
+# Prints one title per line. Returns 1 if the API request fails.
+_ado_fetch_work_item_titles() {
+    local base="$1" enc_project="$2" ids_csv="$3"
+    if [[ -z "$ids_csv" ]]; then
+        return 0
+    fi
+    local wi_path items_json
+    wi_path="${enc_project}/_apis/wit/workitems?ids=${ids_csv}&%24fields=System.Title"
+    if ! items_json="$(ado_api_request "$base" "$wi_path")"; then
+        return 1
+    fi
+    echo "$items_json" | jq -r '.value[]?.fields["System.Title"] // empty'
+}
+
+# _ado_work_items_abort_or_empty: in NIGHTSHIFT_ADO_STRICT mode, return 1; else print empty and return 0
+_ado_work_items_abort_or_empty() {
+    if [[ -n "${NIGHTSHIFT_ADO_STRICT:-}" ]]; then
+        return 1
+    fi
+    echo ""
+    return 0
+}
+
+# fetch_ado_work_items <repo_dir> [repo_config_json]
+# Newline-separated titles of non-Closed, non-Done work items tagged nightshift and nightshift-repo:{repo}.
+# Same shape as fetch_open_issues. On error or missing PAT/metadata, returns empty string (errors on stderr).
+# When NIGHTSHIFT_ADO_STRICT is set (cmd_run), returns non-zero on those failures.
+fetch_ado_work_items() {
+    local repo_dir="$1"
+    local repo_config="${2-}"
+    [[ -z "$repo_config" ]] && repo_config="{}"
+
+    if ! require_ado_pat; then
+        _ado_work_items_abort_or_empty
+        return
+    fi
+
+    local meta org project repo
+    meta="$(resolved_ado_metadata "$repo_dir" "$repo_config")"
+    org="$(echo "$meta" | jq -r '.org // empty')"
+    project="$(echo "$meta" | jq -r '.project // empty')"
+    repo="$(echo "$meta" | jq -r '.repo // empty')"
+
+    if [[ -z "$org" ]] || [[ -z "$project" ]] || [[ -z "$repo" ]] || [[ "$org" == "null" ]]; then
+        _ado_work_items_abort_or_empty
+        return
+    fi
+
+    local repo_esc="$repo"
+    repo_esc="${repo_esc//\'/\'\'}"
+
+    local wiql
+    wiql="SELECT [System.Title] FROM WorkItems WHERE [System.Tags] CONTAINS 'nightshift' AND [System.Tags] CONTAINS 'nightshift-repo:${repo_esc}' AND [System.State] <> 'Closed' AND [System.State] <> 'Done'"
+
+    local query_json base enc_project wiql_path wiql_response
+    query_json="$(jq -n --arg q "$wiql" '{query: $q}')"
+    base="https://dev.azure.com/${org}"
+    enc_project="$(jq -rn --arg p "$project" '$p|@uri')"
+    wiql_path="${enc_project}/_apis/wit/wiql"
+
+    if ! wiql_response="$(ado_api_post_request "$base" "$wiql_path" "$query_json")"; then
+        _ado_work_items_abort_or_empty
+        return
+    fi
+
+    local titles="" batch="" n=0 chunk_lines
+    while IFS= read -r wid; do
+        [[ -z "$wid" ]] && continue
+        [[ -n "$batch" ]] && batch+=","
+        batch+="$wid"
+        n=$((n + 1))
+        if [[ "$n" -eq 200 ]]; then
+            if ! chunk_lines="$(_ado_fetch_work_item_titles "$base" "$enc_project" "$batch")"; then
+                _ado_work_items_abort_or_empty
+                return
+            fi
+            if [[ -n "$chunk_lines" ]]; then
+                [[ -n "$titles" ]] && titles+=$'\n'
+                titles+="$chunk_lines"
+            fi
+            batch=""
+            n=0
+        fi
+    done < <(echo "$wiql_response" | jq -r '.workItems[]?.id // empty')
+
+    if [[ -n "$batch" ]]; then
+        if ! chunk_lines="$(_ado_fetch_work_item_titles "$base" "$enc_project" "$batch")"; then
+            _ado_work_items_abort_or_empty
+            return
+        fi
+        if [[ -n "$chunk_lines" ]]; then
+            [[ -n "$titles" ]] && titles+=$'\n'
+            titles+="$chunk_lines"
+        fi
+    fi
+
+    printf '%s' "$titles"
+    return 0
+}
+
+# In NIGHTSHIFT_ADO_STRICT mode, return 1; else print None and return 0
+_ado_prs_abort_or_none() {
+    if [[ -n "${NIGHTSHIFT_ADO_STRICT:-}" ]]; then
+        return 1
+    fi
+    echo "None"
+    return 0
+}
+
+# fetch_ado_prs <repo_dir> [repo_config_json]
+# Active PRs via GET .../repositories/.../pullrequests?searchCriteria.status=active. Same text shape as fetch_open_prs
+# (PR: title, body, ---). Prints "None" if there are no active PRs, on API error, or if metadata/PAT is missing.
+# When NIGHTSHIFT_ADO_STRICT is set, returns non-zero on PAT/metadata/API failure (cmd_run only).
+fetch_ado_prs() {
+    local repo_dir="$1"
+    local repo_config="${2-}"
+    [[ -z "$repo_config" ]] && repo_config="{}"
+
+    if ! require_ado_pat; then
+        _ado_prs_abort_or_none
+        return
+    fi
+
+    local meta org project reponame
+    meta="$(resolved_ado_metadata "$repo_dir" "$repo_config")"
+    org="$(echo "$meta" | jq -r '.org // empty')"
+    project="$(echo "$meta" | jq -r '.project // empty')"
+    reponame="$(echo "$meta" | jq -r '.repo // empty')"
+
+    if [[ -z "$org" ]] || [[ -z "$project" ]] || [[ -z "$reponame" ]] || [[ "$org" == "null" ]]; then
+        _ado_prs_abort_or_none
+        return
+    fi
+
+    local base enc_project enc_repo pr_path pr_json
+    base="https://dev.azure.com/${org}"
+    enc_project="$(jq -rn --arg p "$project" '$p|@uri')"
+    enc_repo="$(jq -rn --arg r "$reponame" '$r|@uri')"
+    pr_path="${enc_project}/_apis/git/repositories/${enc_repo}/pullrequests?searchCriteria.status=active"
+
+    if ! pr_json="$(ado_api_request "$base" "$pr_path")"; then
+        _ado_prs_abort_or_none
+        return
+    fi
+
+    local n
+    n="$(echo "$pr_json" | jq -r '.value | length' 2>/dev/null)" || n="0"
+    if ! [[ "$n" =~ ^[0-9]+$ ]]; then
+        n="0"
+    fi
+    if [[ "$n" -eq 0 ]]; then
+        echo "None"
+        return 0
+    fi
+
+    local formatted
+    if ! formatted="$(echo "$pr_json" | jq -r '.value[]? | "PR: \(.title)\n\(.description // "")\n---"' 2>/dev/null)"; then
+        log "  Error: Failed to parse Azure DevOps pull request JSON"
+        echo "Error: Failed to parse Azure DevOps pull request JSON" >&2
+        if [[ -n "${NIGHTSHIFT_ADO_STRICT:-}" ]]; then
+            return 1
+        fi
+        echo "None"
+        return 0
+    fi
+    if [[ -z "$formatted" ]]; then
+        echo "None"
+    else
+        printf '%s' "$formatted"
+    fi
+    return 0
+}
+
+# check_ado_auth <organization>
+# Validates NIGHTSHIFT_ADO_PAT against GET .../_apis/projects?%24top=1 (dev.azure.com).
+check_ado_auth() {
+    local org="${1-}"
+    if [[ -z "$org" ]]; then
+        echo "check_ado_auth: organization name is required (e.g. the segment after https://dev.azure.com/)" >&2
+        return 1
+    fi
+    if ! require_ado_pat; then
+        return 1
+    fi
+    local base="https://dev.azure.com/${org}"
+    if ! ado_api_request "$base" "_apis/projects?%24top=1" >/dev/null; then
+        return 1
+    fi
+    echo "Azure DevOps authentication OK for organization '$org' (PAT accepted)."
+    return 0
+}
+
+# ado_uri_encode_wit_type_segment <work_item_type_name>
+# Path segment for .../workitemtypes/{segment}/fields (URI-encoded type name per REST docs).
+ado_uri_encode_wit_type_segment() {
+    local t="${1-}"
+    jq -rn --arg wit "$t" '$wit|@uri'
+}
+
+# ado_wit_fields_response_to_required_prompt_json <json_body>
+# JSON array of {referenceName, name} for alwaysRequired fields, excluding fields nightshift sets in the patch.
+ado_wit_fields_response_to_required_prompt_json() {
+    local body="${1-}"
+    echo "$body" | jq '[.value[]?
+        | select(.alwaysRequired == true)
+        | select(.referenceName != "System.Title"
+            and .referenceName != "System.Description"
+            and .referenceName != "System.State"
+            and .referenceName != "System.Tags")
+        | {referenceName, name: (.name // .referenceName)}]'
+}
+
+# ado_fetch_wit_required_fields_json <org> <project> <work_item_type_name>
+# Prints JSON array of {referenceName, name} on stdout, or empty array. Errors to stderr; returns non-zero on API failure.
+ado_fetch_wit_required_fields_json() {
+    local org="${1-}" project="${2-}" wit="${3-}"
+    if [[ -z "$org" ]] || [[ -z "$project" ]] || [[ -z "$wit" ]]; then
+        echo "ado_fetch_wit_required_fields_json: org, project, and work item type are required" >&2
+        return 1
+    fi
+    local base enc_project type_seg path resp
+    base="https://dev.azure.com/${org}"
+    enc_project="$(jq -rn --arg p "$project" '$p|@uri')"
+    type_seg="$(ado_uri_encode_wit_type_segment "$wit")"
+    path="${enc_project}/_apis/wit/workitemtypes/${type_seg}/fields"
+    if ! resp="$(ado_api_request "$base" "$path")"; then
+        return 1
+    fi
+    ado_wit_fields_response_to_required_prompt_json "$resp"
+}
+
+# init_normalize_work_item_type_choice <user_input_or_empty>
+# Maps PBI/Bug/Task (any case) or full names to canonical ADO type string.
+init_normalize_work_item_type_choice() {
+    local raw="${1-}"
+    raw="$(echo "$raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    local lower
+    lower="$(echo "$raw" | tr '[:upper:]' '[:lower:]')"
+    case "$lower" in
+        ""|pbi|"product backlog item")
+            echo "Product Backlog Item"
+            ;;
+        bug)
+            echo "Bug"
+            ;;
+        task)
+            echo "Task"
+            ;;
+        *)
+            echo "$raw"
+            ;;
+    esac
+}
+
+# init_ado_repo_fully_configured <repo_config_json> <required_fields_json_array> <work_item_type>
+# Returns 0 if ado_work_item_type matches and ado_fields contains a non-empty string for each required referenceName.
+init_ado_repo_fully_configured() {
+    local cfg="${1-}" required_json="${2-}" wit="${3-}"
+    local saved_type
+    saved_type="$(echo "$cfg" | jq -r '.ado_work_item_type // empty' 2>/dev/null)" || saved_type=""
+    if [[ -z "$saved_type" ]] || [[ "$saved_type" == "null" ]]; then
+        return 1
+    fi
+    if [[ "$saved_type" != "$wit" ]]; then
+        return 1
+    fi
+    if ! echo "$cfg" | jq -e '(.ado_fields | type) == "object"' &>/dev/null; then
+        return 1
+    fi
+    if ! echo "$required_json" | jq -e --argjson c "$cfg" '
+        all(.[]; .referenceName as $r
+            | ($c.ado_fields[$r] // "") as $v
+            | ($v | type == "string") and (($v | length) > 0))
+    ' &>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
 # --- Git operations ---
 
 prepare_repo() {
@@ -336,6 +1039,54 @@ fetch_open_prs() {
         | jq -r '.[] | "PR: \(.title)\n\(.body // "")\n---"' 2>/dev/null || echo "None"
 }
 
+# --- Provider dispatch (per-repo routing) ---
+
+fetch_open_issues_for_repo() {
+    local repo_dir="$1"
+    local repo_config="${2-}"
+    [[ -z "$repo_config" ]] && repo_config="{}"
+
+    local provider
+    provider="$(detect_provider "$repo_dir" "$repo_config")"
+    if [[ "$provider" == "azuredevops" ]]; then
+        fetch_ado_work_items "$repo_dir" "$repo_config"
+    else
+        fetch_open_issues "$repo_dir"
+    fi
+}
+
+fetch_open_prs_for_repo() {
+    local repo_dir="$1"
+    local repo_config="${2-}"
+    [[ -z "$repo_config" ]] && repo_config="{}"
+
+    local provider
+    provider="$(detect_provider "$repo_dir" "$repo_config")"
+    if [[ "$provider" == "azuredevops" ]]; then
+        fetch_ado_prs "$repo_dir" "$repo_config"
+    else
+        fetch_open_prs "$repo_dir"
+    fi
+}
+
+create_work_item_for_repo() {
+    local repo_dir="$1"
+    local repo_config="${2-}"
+    local agent="${3-}"
+    local agent_label="${4-}"
+    local title="${5-}"
+    local body="${6-}"
+    [[ -z "$repo_config" ]] && repo_config="{}"
+
+    local provider
+    provider="$(detect_provider "$repo_dir" "$repo_config")"
+    if [[ "$provider" == "azuredevops" ]]; then
+        create_ado_work_item "$repo_dir" "$repo_config" "$agent" "$title" "$body"
+    else
+        create_github_issue "$repo_dir" "$title" "$agent_label" "$body"
+    fi
+}
+
 is_duplicate() {
     local title="$1"
     local existing_titles="$2"
@@ -362,6 +1113,8 @@ process_findings() {
     local agent="$2"
     local json_response="$3"
     local existing_titles="$4"
+    local repo_config="${5-}"
+    [[ -z "$repo_config" ]] && repo_config="{}"
 
     local json_key agent_label severity_field
     json_key="$(get_json_key "$agent")"
@@ -371,6 +1124,7 @@ process_findings() {
     local count
     count="$(echo "$json_response" | jq -r ".${json_key} | length" 2>/dev/null)" || {
         log "  Error: Failed to parse JSON for $agent"
+        record_run_error parse "$(basename "$repo_dir")" "Failed to parse JSON structure for $agent (jq)"
         ERRORS=$((ERRORS + 1))
         return 1
     }
@@ -426,11 +1180,18 @@ process_findings() {
 
 ${description}"
 
-        if create_github_issue "$repo_dir" "$title" "$agent_label" "$body"; then
+        local created_ok=false
+        if create_work_item_for_repo "$repo_dir" "$repo_config" "$agent" "$agent_label" "$title" "$body"; then
+            created_ok=true
+        fi
+        if [[ "$created_ok" == "true" ]]; then
             created=$((created + 1))
             ISSUES_CREATED=$((ISSUES_CREATED + 1))
         else
             ERRORS=$((ERRORS + 1))
+            if [[ "$(detect_provider "$repo_dir" "$repo_config")" == "azuredevops" ]]; then
+                record_run_error api "$(basename "$repo_dir")" "Failed to create Azure DevOps work item"
+            fi
         fi
 
         i=$((i + 1))
@@ -441,12 +1202,24 @@ ${description}"
 
 # --- cmd: run ---
 
+repo_in_skip_list() {
+    local path="$1"
+    local list="${2-}"
+    local line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        [[ "$line" == "$path" ]] && return 0
+    done <<< "$list"
+    return 1
+}
+
 cmd_run() {
     log "Starting nightshift run"
 
-    if ! check_gh; then
-        exit 1
-    fi
+    RUN_ERR_AUTH_LINES=""
+    RUN_ERR_API_LINES=""
+    RUN_ERR_PARSE_LINES=""
+    RUN_ERR_CLI_LINES=""
 
     if [[ -z "$PROMPTS_DIR" ]] || [[ ! -d "$PROMPTS_DIR" ]]; then
         log "Error: Prompts directory not found"
@@ -459,25 +1232,120 @@ cmd_run() {
     local repos repo_count
     repos="$(discover_repos "$repos_root")"
     repo_count="$(echo "$repos" | grep -c . 2>/dev/null || echo 0)"
+
+    local need_github=false
+    local ado_repos_qualified=""
+    local skip_repos=""
+    local repo_dir_scan
+    while IFS= read -r repo_dir_scan; do
+        [[ -z "$repo_dir_scan" ]] && continue
+        local scan_config="{}"
+        if [[ -f "$repo_dir_scan/.nightshift.json" ]]; then
+            scan_config="$(cat "$repo_dir_scan/.nightshift.json")"
+        fi
+        local scan_provider
+        scan_provider="$(detect_provider "$repo_dir_scan" "$scan_config")"
+        if [[ "$scan_provider" == "azuredevops" ]]; then
+            local scan_org
+            scan_org="$(resolved_ado_metadata "$repo_dir_scan" "$scan_config" | jq -r '.org // empty')"
+            if [[ -z "$scan_org" ]] || [[ "$scan_org" == "null" ]]; then
+                log "Error: Azure DevOps provider for $(basename "$repo_dir_scan") but organization could not be resolved (check git remote and .nightshift.json ado_org)."
+                record_run_error auth "$(basename "$repo_dir_scan")" "Organization could not be resolved (check git remote and .nightshift.json ado_org)"
+                skip_repos="${skip_repos}${repo_dir_scan}"$'\n'
+                ERRORS=$((ERRORS + 1))
+            else
+                ado_repos_qualified="${ado_repos_qualified}${repo_dir_scan}|${scan_org}"$'\n'
+            fi
+        else
+            need_github=true
+        fi
+    done <<< "$repos"
+
+    if [[ "$need_github" == true ]]; then
+        if ! check_gh; then
+            exit 1
+        fi
+    fi
+
+    if [[ -n "$ado_repos_qualified" ]]; then
+        if ! require_ado_pat; then
+            while IFS='|' read -r path_ado o_ado; do
+                [[ -z "$path_ado" ]] && continue
+                log "Error: NIGHTSHIFT_ADO_PAT is not set; skipping $(basename "$path_ado")"
+                record_run_error auth "$(basename "$path_ado")" "NIGHTSHIFT_ADO_PAT is not set (Azure DevOps)"
+                skip_repos="${skip_repos}${path_ado}"$'\n'
+                ERRORS=$((ERRORS + 1))
+            done <<< "$ado_repos_qualified"
+        else
+            local uorg
+            uorg="$(printf '%s' "$ado_repos_qualified" | cut -d'|' -f2 | sort -u)"
+            while IFS= read -r ado_org; do
+                [[ -z "$ado_org" ]] && continue
+                if ! check_ado_auth "$ado_org" &>/dev/null; then
+                    while IFS='|' read -r path2 org2; do
+                        [[ -z "$path2" ]] && continue
+                        if [[ "$org2" == "$ado_org" ]]; then
+                            if repo_in_skip_list "$path2" "$skip_repos"; then
+                                continue
+                            fi
+                            log "Error: Azure DevOps authentication failed for $(basename "$path2") (organization: $ado_org)"
+                            record_run_error auth "$(basename "$path2")" "Azure DevOps authentication failed for organization '$ado_org'"
+                            skip_repos="${skip_repos}${path2}"$'\n'
+                            ERRORS=$((ERRORS + 1))
+                        fi
+                    done <<< "$ado_repos_qualified"
+                fi
+            done <<< "$uorg"
+        fi
+    fi
+
     log "Scanning $repo_count repos in $repos_root"
 
+    export NIGHTSHIFT_ADO_STRICT=1
     local repo_dir
     while IFS= read -r repo_dir; do
         [[ -z "$repo_dir" ]] && continue
         local repo_name
         repo_name="$(basename "$repo_dir")"
 
+        if repo_in_skip_list "$repo_dir" "$skip_repos"; then
+            log "Skipping $repo_name (Azure DevOps preflight error)"
+            continue
+        fi
+
         prepare_repo "$repo_dir"
-
-        local existing_titles
-        existing_titles="$(fetch_open_issues "$repo_dir")"
-
-        local open_prs
-        open_prs="$(fetch_open_prs "$repo_dir")"
 
         local repo_config="{}"
         if [[ -f "$repo_dir/.nightshift.json" ]]; then
             repo_config="$(cat "$repo_dir/.nightshift.json")"
+        fi
+
+        local prov
+        prov="$(detect_provider "$repo_dir" "$repo_config")"
+        local existing_titles open_prs
+        if [[ "$prov" == "azuredevops" ]]; then
+            local errf
+            errf="$(mktemp)"
+            if ! existing_titles="$(fetch_open_issues_for_repo "$repo_dir" "$repo_config" 2>"$errf")"; then
+                log "  Error: could not load open work items from Azure DevOps; skipping $repo_name"
+                record_run_error_from_ado_log "$repo_name" "$errf"
+                rm -f "$errf"
+                ERRORS=$((ERRORS + 1))
+                continue
+            fi
+            rm -f "$errf"
+            errf="$(mktemp)"
+            if ! open_prs="$(fetch_open_prs_for_repo "$repo_dir" "$repo_config" 2>"$errf")"; then
+                log "  Error: could not load open pull requests from Azure DevOps; skipping $repo_name"
+                record_run_error_from_ado_log "$repo_name" "$errf"
+                rm -f "$errf"
+                ERRORS=$((ERRORS + 1))
+                continue
+            fi
+            rm -f "$errf"
+        else
+            existing_titles="$(fetch_open_issues_for_repo "$repo_dir" "$repo_config")"
+            open_prs="$(fetch_open_prs_for_repo "$repo_dir" "$repo_config")"
         fi
 
         local agent
@@ -512,34 +1380,200 @@ cmd_run() {
             if response="$(invoke_cli "$cli" "$tmp_prompt" "$repo_dir" 2>&1)"; then
                 local json_response
                 if json_response="$(extract_json "$response")"; then
-                    process_findings "$repo_dir" "$agent" "$json_response" "$existing_titles"
+                    process_findings "$repo_dir" "$agent" "$json_response" "$existing_titles" "$repo_config"
                 else
                     log "  Error: Invalid JSON from $agent agent"
+                    record_run_error parse "$repo_name" "Invalid JSON from $agent agent output ($cli)"
                     ERRORS=$((ERRORS + 1))
                 fi
             else
                 log "  Error: $agent agent ($cli) failed"
+                record_run_error cli "$repo_name" "$agent agent ($cli) failed"
                 ERRORS=$((ERRORS + 1))
             fi
 
             rm -f "$tmp_prompt"
         done
     done <<< "$repos"
+    unset NIGHTSHIFT_ADO_STRICT
 
     log "Run complete — $ISSUES_CREATED issues created, $ISSUES_SKIPPED skipped (duplicate), $ERRORS error(s)"
+    emit_run_error_summary
 }
 
 # --- cmd: init ---
 
+# init_prompt_append_gitignore <repo_directory>
+init_prompt_append_gitignore() {
+    local repo_dir="${1-}"
+    local gi="$repo_dir/.gitignore"
+    if [[ -f "$gi" ]] && grep -qE '^[[:space:]]*\.nightshift\.json[[:space:]]*$' "$gi" 2>/dev/null; then
+        return 0
+    fi
+    local ans
+    read -r -p "Add .nightshift.json to .gitignore in $(basename "$repo_dir")? [y/N]: " ans || true
+    if [[ "$ans" == "y" ]] || [[ "$ans" == "Y" ]]; then
+        printf '\n# nightshift local config\n.nightshift.json\n' >> "$gi"
+        echo "  Appended .nightshift.json to $gi"
+    fi
+}
+
+# cmd_init_process_ado_repos <repos_root_expanded> <global_wit_full> <reuse_state_file>
+cmd_init_process_ado_repos() {
+    local repos_root_expanded="${1-}" global_wit_full="${2-}" reuse_state="${3-}"
+    local repos repo_dir
+    repos="$(discover_repos "$repos_root_expanded")"
+
+    echo "Configuring Azure DevOps repositories (.nightshift.json)..."
+    while IFS= read -r repo_dir; do
+        [[ -z "$repo_dir" ]] && continue
+        local repo_name pc pv
+        repo_name="$(basename "$repo_dir")"
+        pc="{}"
+        if [[ -f "$repo_dir/.nightshift.json" ]]; then
+            pc="$(cat "$repo_dir/.nightshift.json")"
+        fi
+        pv="$(detect_provider "$repo_dir" "$pc")"
+        if [[ "$pv" != "azuredevops" ]]; then
+            continue
+        fi
+
+        local meta org project reponame
+        meta="$(resolved_ado_metadata "$repo_dir" "$pc")"
+        org="$(echo "$meta" | jq -r '.org // empty')"
+        project="$(echo "$meta" | jq -r '.project // empty')"
+        reponame="$(echo "$meta" | jq -r '.repo // empty')"
+        if [[ -z "$org" ]] || [[ "$org" == "null" ]] || [[ -z "$project" ]] || [[ "$project" == "null" ]]; then
+            echo "  $repo_name: skip ADO config (could not resolve organization/project from remote or .nightshift.json)"
+            continue
+        fi
+
+        local wit wit_in saved_type
+        saved_type="$(echo "$pc" | jq -r '.ado_work_item_type // empty' 2>/dev/null)" || saved_type=""
+        if [[ -n "$saved_type" ]] && [[ "$saved_type" != "null" ]]; then
+            wit="$saved_type"
+            echo "  $repo_name: work item type (saved): $wit"
+        else
+            read -r -p "  Work item type for $repo_name — PBI, Bug, or Task [$(init_wit_to_short_label "$global_wit_full")]: " wit_in || wit_in=""
+            wit="$(init_normalize_work_item_type_choice "${wit_in:-$global_wit_full}")"
+        fi
+
+        local required_json
+        if ! required_json="$(ado_fetch_wit_required_fields_json "$org" "$project" "$wit")"; then
+            echo "  $repo_name: could not load required fields from Azure DevOps (check type name and permissions); skipping"
+            continue
+        fi
+
+        if init_ado_repo_fully_configured "$pc" "$required_json" "$wit"; then
+            echo "  $repo_name: ADO settings already present; no changes"
+            local subset_fields
+            subset_fields="$(echo "$pc" | jq --argjson req "$required_json" '
+                ($req | map(.referenceName)) as $keys
+                | (.ado_fields // {})
+                | with_entries(select(.key as $k | $keys | index($k) != null))
+            ')"
+            printf '%s\t%s\n' "${org}|${project}|${wit}" "$(echo "$subset_fields" | jq -c .)" >> "$reuse_state"
+            continue
+        fi
+
+        local cache_key reuse_line reuse_json ans_r
+        cache_key="${org}|${project}|${wit}"
+        reuse_json="{}"
+        if [[ -s "$reuse_state" ]]; then
+            reuse_line="$(awk -F'	' -v k="$cache_key" '$1 == k { print $2; exit }' "$reuse_state")"
+            if [[ -n "$reuse_line" ]]; then
+                reuse_json="$reuse_line"
+                read -r -p "  Reuse required field defaults from another repo in ${project} (${wit})? [Y/n]: " ans_r || ans_r=""
+                if [[ -n "$ans_r" ]] && [[ "$ans_r" != "y" ]] && [[ "$ans_r" != "Y" ]]; then
+                    reuse_json="{}"
+                fi
+            fi
+        fi
+
+        local existing_fields
+        existing_fields="$(echo "$pc" | jq '.ado_fields // {}' 2>/dev/null)" || existing_fields="{}"
+
+        local final_fields
+        final_fields="$existing_fields"
+        local idx ref fname val cur prompt_val
+        idx=0
+        local nreq
+        nreq="$(echo "$required_json" | jq 'length' 2>/dev/null)" || nreq="0"
+        while [[ "$idx" -lt "$nreq" ]]; do
+            ref="$(echo "$required_json" | jq -r ".[$idx].referenceName")"
+            fname="$(echo "$required_json" | jq -r ".[$idx].name")"
+            cur="$(echo "$final_fields" | jq -r --arg r "$ref" '.[$r] // empty')"
+            prompt_val=""
+            if [[ -n "$cur" ]] && [[ "$cur" != "null" ]]; then
+                idx=$((idx + 1))
+                continue
+            fi
+            if [[ -n "$reuse_json" ]]; then
+                prompt_val="$(echo "$reuse_json" | jq -r --arg r "$ref" '.[$r] // empty' 2>/dev/null)" || prompt_val=""
+            fi
+            if [[ -z "$prompt_val" ]] || [[ "$prompt_val" == "null" ]]; then
+                read -r -p "    ${fname} (${ref}) [required]: " val || val=""
+                prompt_val="$val"
+            fi
+            if [[ -n "$prompt_val" ]]; then
+                final_fields="$(echo "$final_fields" | jq --arg r "$ref" --arg v "$prompt_val" '. + {($r): $v}')"
+            fi
+            idx=$((idx + 1))
+        done
+
+        local cfg_out cfg_before
+        cfg_before="$(echo "$pc" | jq -c . 2>/dev/null)" || cfg_before="{}"
+        cfg_out="$(echo "$pc" | jq --arg wit "$wit" --argjson fields "$final_fields" \
+            '.ado_work_item_type = $wit | .ado_fields = $fields')"
+
+        if [[ "$cfg_before" == "$(echo "$cfg_out" | jq -c .)" ]]; then
+            echo "  $repo_name: no updates needed"
+            continue
+        fi
+
+        printf '%s\n' "$cfg_out" > "$repo_dir/.nightshift.json"
+        echo "  $repo_name: wrote .nightshift.json"
+
+        printf '%s\t%s\n' "$cache_key" "$(echo "$final_fields" | jq -c .)" >> "$reuse_state"
+
+        init_prompt_append_gitignore "$repo_dir"
+    done <<< "$repos"
+    echo ""
+}
+
+init_wit_to_short_label() {
+    case "${1-}" in
+        "Product Backlog Item") echo "PBI" ;;
+        Bug)                    echo "Bug" ;;
+        Task)                   echo "Task" ;;
+        *)                      echo "${1:-PBI}" ;;
+    esac
+}
+
+# Returns 0 if any repo under root (discover_repos) has detect_provider == azuredevops
+init_root_has_ado_repos() {
+    local root="$1"
+    if [[ ! -d "$root" ]]; then
+        return 1
+    fi
+    local repos_preview repo_line pc pv
+    repos_preview="$(discover_repos "$root")"
+    while IFS= read -r repo_line; do
+        [[ -z "$repo_line" ]] && continue
+        pc="{}"
+        if [[ -f "$repo_line/.nightshift.json" ]]; then
+            pc="$(cat "$repo_line/.nightshift.json")"
+        fi
+        pv="$(detect_provider "$repo_line" "$pc")"
+        if [[ "$pv" == "azuredevops" ]]; then
+            return 0
+        fi
+    done <<< "$repos_preview"
+    return 1
+}
+
 cmd_init() {
     echo "nightshift setup"
-    echo ""
-
-    echo "Checking GitHub CLI..."
-    if ! check_gh; then
-        exit 1
-    fi
-    echo "  gh is installed and authenticated"
     echo ""
 
     echo "Detecting AI CLIs..."
@@ -558,15 +1592,103 @@ cmd_init() {
     echo ""
 
     local repos_root
-    read -r -p "Repos root directory [~/Developer]: " repos_root
-    repos_root="${repos_root:-~/Developer}"
-    local repos_root_expanded="${repos_root/#\~/$HOME}"
+    local repos_root_expanded
+    if [[ -n "${NIGHTSHIFT_INIT_REPOS_ROOT:-}" ]]; then
+        repos_root_expanded="${NIGHTSHIFT_INIT_REPOS_ROOT}"
+        repos_root="$repos_root_expanded"
+    else
+        read -r -p "Repos root directory [~/Developer]: " repos_root
+        repos_root="${repos_root:-~/Developer}"
+        repos_root_expanded="${repos_root/#\~/$HOME}"
+    fi
 
     if [[ ! -d "$repos_root_expanded" ]]; then
         echo "Error: Directory not found: $repos_root_expanded"
         exit 1
     fi
     echo ""
+
+    local repos_preview need_github has_ado repo_line pc pv
+    repos_preview="$(discover_repos "$repos_root_expanded")"
+    need_github=false
+    has_ado=false
+    while IFS= read -r repo_line; do
+        [[ -z "$repo_line" ]] && continue
+        pc="{}"
+        if [[ -f "$repo_line/.nightshift.json" ]]; then
+            pc="$(cat "$repo_line/.nightshift.json")"
+        fi
+        pv="$(detect_provider "$repo_line" "$pc")"
+        if [[ "$pv" == "azuredevops" ]]; then
+            has_ado=true
+        else
+            need_github=true
+        fi
+    done <<< "$repos_preview"
+
+    if [[ "$need_github" == true ]]; then
+        echo "Checking GitHub CLI..."
+        if ! check_gh; then
+            exit 1
+        fi
+        echo "  gh is installed and authenticated"
+        echo ""
+    else
+        echo "No GitHub remotes detected under repos root; skipping GitHub CLI check."
+        echo ""
+    fi
+
+    local ado_default_wit_full wit_prompt_default prev_wit
+    ado_default_wit_full="Product Backlog Item"
+    wit_prompt_default="PBI"
+    if [[ "$has_ado" == true ]]; then
+        if ! require_ado_pat; then
+            exit 1
+        fi
+        local org_lines uorg org
+        org_lines=""
+        while IFS= read -r repo_line; do
+            [[ -z "$repo_line" ]] && continue
+            pc="{}"
+            if [[ -f "$repo_line/.nightshift.json" ]]; then
+                pc="$(cat "$repo_line/.nightshift.json")"
+            fi
+            if [[ "$(detect_provider "$repo_line" "$pc")" != "azuredevops" ]]; then
+                continue
+            fi
+            org="$(resolved_ado_metadata "$repo_line" "$pc" | jq -r '.org // empty')"
+            if [[ -n "$org" ]] && [[ "$org" != "null" ]]; then
+                org_lines="${org_lines}${org}"$'\n'
+            fi
+        done <<< "$repos_preview"
+        uorg="$(printf '%s' "$org_lines" | sort -u | sed '/^$/d')"
+        while IFS= read -r org; do
+            [[ -z "$org" ]] && continue
+            if ! check_ado_auth "$org"; then
+                echo "Error: Azure DevOps PAT validation failed for organization '$org'."
+                echo "Set NIGHTSHIFT_ADO_PAT and ensure it can read work items, then run init again."
+                exit 1
+            fi
+        done <<< "$uorg"
+
+        if [[ -f "$CONFIG_FILE" ]]; then
+            prev_wit="$(jq -r '.ado_default_work_item_type // empty' "$CONFIG_FILE" 2>/dev/null)" || prev_wit=""
+            if [[ -n "$prev_wit" ]] && [[ "$prev_wit" != "null" ]]; then
+                ado_default_wit_full="$prev_wit"
+                wit_prompt_default="$(init_wit_to_short_label "$prev_wit")"
+            fi
+        fi
+
+        local wit_g_in
+        echo "Azure DevOps: choose the default work item type for new repos (you can override per repo)."
+        read -r -p "Default work item type (PBI, Bug, Task) [$wit_prompt_default]: " wit_g_in || wit_g_in=""
+        if [[ -n "$wit_g_in" ]]; then
+            ado_default_wit_full="$(init_normalize_work_item_type_choice "$wit_g_in")"
+        else
+            ado_default_wit_full="$(init_normalize_work_item_type_choice "$wit_prompt_default")"
+        fi
+        echo ""
+    fi
 
     local run_hour
     read -r -p "Run time (hour, 0-23) [2]: " run_hour
@@ -610,38 +1732,64 @@ cmd_init() {
 
     mkdir -p "$NIGHTSHIFT_DIR"
     local config
-    config="$(jq -n \
-        --arg repos_root "$repos_root" \
-        --arg schedule "$schedule" \
-        --argjson agents "$agents_json" \
-        '{repos_root: $repos_root, schedule: $schedule, agents: $agents}')"
+    if [[ "$has_ado" == true ]]; then
+        config="$(jq -n \
+            --arg repos_root "$repos_root" \
+            --arg schedule "$schedule" \
+            --argjson agents "$agents_json" \
+            --arg ado_wit "$ado_default_wit_full" \
+            '{repos_root: $repos_root, schedule: $schedule, agents: $agents, ado_default_work_item_type: $ado_wit}')"
+    else
+        config="$(jq -n \
+            --arg repos_root "$repos_root" \
+            --arg schedule "$schedule" \
+            --argjson agents "$agents_json" \
+            '{repos_root: $repos_root, schedule: $schedule, agents: $agents}')"
+    fi
 
     echo "$config" > "$CONFIG_FILE"
     echo "Config written to $CONFIG_FILE"
     echo ""
 
-    echo "Creating labels in discovered repos..."
-    local repos
-    repos="$(discover_repos "$repos_root_expanded")"
+    if [[ "$need_github" == true ]]; then
+        echo "Creating labels in GitHub repositories..."
+        local repos repo_dir
+        repos="$(discover_repos "$repos_root_expanded")"
 
-    local repo_dir
-    while IFS= read -r repo_dir; do
-        [[ -z "$repo_dir" ]] && continue
-        local repo_name
-        repo_name="$(basename "$repo_dir")"
-        echo "  $repo_name"
+        while IFS= read -r repo_dir; do
+            [[ -z "$repo_dir" ]] && continue
+            local repo_name rcfg prov
+            repo_name="$(basename "$repo_dir")"
+            rcfg="{}"
+            if [[ -f "$repo_dir/.nightshift.json" ]]; then
+                rcfg="$(cat "$repo_dir/.nightshift.json")"
+            fi
+            prov="$(detect_provider "$repo_dir" "$rcfg")"
+            if [[ "$prov" == "azuredevops" ]]; then
+                continue
+            fi
 
-        cd "$repo_dir"
-        gh label create "nightshift" --description "Raised by nightshift" --color "1d1d8a" --force 2>/dev/null || true
+            echo "  $repo_name"
 
-        local agent
-        for agent in $ALL_AGENTS; do
-            local label
-            label="$(get_label "$agent")"
-            gh label create "$label" --force 2>/dev/null || true
-        done
-    done <<< "$repos"
-    echo ""
+            cd "$repo_dir"
+            gh label create "nightshift" --description "Raised by nightshift" --color "1d1d8a" --force 2>/dev/null || true
+
+            local agent
+            for agent in $ALL_AGENTS; do
+                local label
+                label="$(get_label "$agent")"
+                gh label create "$label" --force 2>/dev/null || true
+            done
+        done <<< "$repos"
+        echo ""
+    fi
+
+    if [[ "$has_ado" == true ]]; then
+        local ado_reuse_state
+        ado_reuse_state="$(mktemp)"
+        cmd_init_process_ado_repos "$repos_root_expanded" "$ado_default_wit_full" "$ado_reuse_state"
+        rm -f "$ado_reuse_state"
+    fi
 
     register_cron "$schedule"
 
@@ -785,6 +1933,63 @@ cmd_status() {
     fi
     echo ""
 
+    echo "Azure DevOps:"
+    if [[ -z "${NIGHTSHIFT_ADO_PAT:-}" ]]; then
+        echo "  [--] PAT (not set)"
+    else
+        local status_rr ado_cnt ado_org_lines uorg pat_all_ok _rd _cfg _pv _org
+        status_rr=""
+        ado_cnt=0
+        ado_org_lines=""
+        if [[ -f "$CONFIG_FILE" ]]; then
+            status_rr="$(get_repos_root 2>/dev/null)" || status_rr=""
+            if [[ -n "$status_rr" ]] && [[ -d "$status_rr" ]]; then
+                while IFS= read -r _rd; do
+                    [[ -z "$_rd" ]] && continue
+                    _cfg="{}"
+                    if [[ -f "$_rd/.nightshift.json" ]]; then
+                        _cfg="$(cat "$_rd/.nightshift.json")"
+                    fi
+                    _pv="$(detect_provider "$_rd" "$_cfg")"
+                    if [[ "$_pv" == "azuredevops" ]]; then
+                        ado_cnt=$((ado_cnt + 1))
+                        _org="$(resolved_ado_metadata "$_rd" "$_cfg" | jq -r '.org // empty')"
+                        if [[ -n "$_org" ]] && [[ "$_org" != "null" ]]; then
+                            ado_org_lines="${ado_org_lines}${_org}"$'\n'
+                        fi
+                    fi
+                done <<< "$(discover_repos "$status_rr")"
+            fi
+        fi
+
+        uorg=""
+        if [[ -n "$ado_org_lines" ]]; then
+            uorg="$(printf '%s' "$ado_org_lines" | sort -u | sed '/^$/d')"
+        fi
+
+        if [[ "$ado_cnt" -eq 0 ]]; then
+            echo "  [ok] PAT (set)"
+        elif [[ -z "$uorg" ]]; then
+            echo "  [--] PAT (invalid)"
+        else
+            pat_all_ok=true
+            while IFS= read -r _org; do
+                [[ -z "$_org" ]] && continue
+                if ! check_ado_auth "$_org" &>/dev/null; then
+                    pat_all_ok=false
+                    break
+                fi
+            done <<< "$uorg"
+            if [[ "$pat_all_ok" == "true" ]]; then
+                echo "  [ok] PAT (valid)"
+            else
+                echo "  [--] PAT (invalid)"
+            fi
+        fi
+        echo "  ADO repos: $ado_cnt"
+    fi
+    echo ""
+
     echo "Schedule:"
     local cron_schedule
     cron_schedule="$(get_cron_schedule)"
@@ -807,6 +2012,8 @@ Usage:
   nightshift logs       View the latest log file
   nightshift logs DATE  View log for a specific date (YYYY-MM-DD)
   nightshift status     Show config and detected CLIs
+  nightshift check-ado-auth ORG
+                        Verify NIGHTSHIFT_ADO_PAT against Azure DevOps (projects API)
 EOF
 }
 
@@ -818,6 +2025,7 @@ case "${1:-}" in
     run)    shift; cmd_run "$@" ;;
     logs)   shift; cmd_logs "$@" ;;
     status) cmd_status ;;
+    check-ado-auth) shift; check_ado_auth "${1-}" || exit 1 ;;
     -h|--help|help) usage ;;
     "")     usage ;;
     *)      echo "Unknown command: $1"; usage; exit 1 ;;
