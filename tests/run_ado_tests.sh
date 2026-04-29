@@ -387,6 +387,12 @@ BUG_CFG="$(jq -nc --argjson id "$ADO_TEST_IDENTITY" '$id * {ado_work_item_type:"
 if ! ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/adowiql\" $(printf '%q' "$BUG_CFG") bugs \"[nightshift] X\" \"D\""; then
   fail "create Bug type failed"
 fi
+
+TASK_CREATE_CFG="$(jq -nc --argjson id "$ADO_TEST_IDENTITY" '$id * {ado_work_item_type:"  TaSk " }')"
+if ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/adowiql\" $(printf '%q' "$TASK_CREATE_CFG") bugs \"[nightshift] TaskType\" \"D\"" 2>"$errdir/errcwiTask"; then
+  fail "create_ado_work_item should reject built-in Task (trim + case-fold)"
+fi
+grep -q "not allowed" "$errdir/errcwiTask" || fail "create Task WIT err: $(cat "$errdir/errcwiTask")"
 uwi2="$(cat "$urlog")"
 if [[ "$uwi2" != *"%24Bug"* ]] && [[ "$uwi2" != *'$Bug'* ]]; then
   fail "Bug work item URL: $uwi2"
@@ -539,6 +545,10 @@ if ! init_ado_repo_fully_configured "$cfg_ok" "$req_one" "Bug"; then
 fi
 if init_ado_repo_fully_configured "$cfg_ok" "$req_one" "Task"; then
   fail "init_ado_repo_fully_configured should fail on type mismatch"
+fi
+TASK_CFG_PARTIAL="$(jq -nc '{ado_work_item_type:"Task","ado_fields":{"Custom.Req":"x"}}')"
+if init_ado_repo_fully_configured "$TASK_CFG_PARTIAL" "$req_one" "Task"; then
+  fail "init_ado_repo_fully_configured should reject saved builtin Task type"
 fi
 if init_ado_repo_fully_configured '{"ado_work_item_type":"Bug","ado_fields":{}}' "$req_one" "Bug"; then
   fail "init_ado_repo_fully_configured should fail when field missing"

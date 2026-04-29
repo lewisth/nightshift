@@ -433,17 +433,12 @@ ado_identity_drifts_from_git_remote() {
     ' | grep -qx true
 }
 
+# Org for PAT preflight during init — only explicit saved ado_org from .nightshift.json (no inference from git remote).
 ado_org_for_pat_probe() {
-    local repo_dir="${1-}"
-    local repo_config="${2-}"
+    local repo_config="${1-}"
+    [[ -z "$repo_config" ]] && repo_config="{}"
     if ado_repo_config_has_explicit_saved_identity "$repo_config"; then
         jq -rn --argjson cfg "$repo_config" '($cfg.ado_org // "") | gsub("^\\s+|\\s+$"; "")'
-        return 0
-    fi
-    local sug
-    sug="$(ado_suggested_identity_from_git_remote "$repo_dir")"
-    if [[ "$sug" != "null" ]]; then
-        echo "$sug" | jq -r '.org // empty'
     fi
 }
 
@@ -1087,7 +1082,7 @@ init_normalize_work_item_type_choice() {
     raw="$(echo "$raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     local lower
     lower="$(echo "$raw" | tr '[:upper:]' '[:lower:]')"
-    if [[ "$lower" == "task" ]]; then
+    if ado_wit_name_is_forbidden_builtin_task "$raw"; then
         echo "Azure DevOps built-in Task work item type is not allowed; use PBIs or Bugs or a custom type whose name is not literally \"task\"." >&2
         return 1
     fi
@@ -1112,6 +1107,9 @@ init_ado_repo_fully_configured() {
     saved_type="$(echo "$cfg" | jq -r '.ado_work_item_type // empty' 2>/dev/null)" || saved_type=""
     saved_type="$(echo "$saved_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     wit_trim="$(echo "$wit" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if ado_wit_name_is_forbidden_builtin_task "$saved_type"; then
+        return 1
+    fi
     if [[ -z "$saved_type" ]] || [[ "$saved_type" == "null" ]]; then
         return 1
     fi
@@ -1881,7 +1879,7 @@ cmd_init() {
             if [[ "$(detect_provider "$repo_line" "$pc")" != "azuredevops" ]] && ! git_origin_matches_azure_devops "$repo_line"; then
                 continue
             fi
-            org="$(ado_org_for_pat_probe "$repo_line" "$pc")"
+            org="$(ado_org_for_pat_probe "$pc")"
             if [[ -n "$org" ]] && [[ "$org" != "null" ]]; then
                 org_lines="${org_lines}${org}"$'\n'
             fi

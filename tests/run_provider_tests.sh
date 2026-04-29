@@ -129,6 +129,11 @@ if ado_require_saved_identity_runtime "$tmp/driftADO" "$drift_cfg" "Test" 2>"$tm
 fi
 grep -Fq "does not match origin remote (drift)" "$tmp/drift.err" || fail "expected drift stderr, got $(cat "$tmp/drift.err")"
 
+p="$(ado_org_for_pat_probe "{}")"
+[[ -z "$p" ]] || fail "PAT probe org must be empty without saved ADO identity (no git inference)"
+p="$(ado_org_for_pat_probe "$(jq -nc '{provider:"azuredevops",ado_org:"contoso",ado_project:"Fabrikam",ado_repo:"R1"}')")"
+[[ "$p" == "contoso" ]] || fail "PAT probe org should come from saved ado_org only, got: $p"
+
 # --- provider dispatch (GitHub path via gh stub) ---
 
 tmpbin="$tmp/bin"
