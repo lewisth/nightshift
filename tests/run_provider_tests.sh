@@ -183,6 +183,22 @@ if init_ado_repo_fully_configured "$(jq -nc '{ado_work_item_type:42,"ado_fields"
     fail "init_ado_repo_fully_configured should reject non-string saved type"
 fi
 
+tmp_atomic="$tmp/atomic_merge"
+mkdir -p "$tmp_atomic"
+printf '%s\n' '{"foo":"keep","agents":{"bugs":"claude"}}' > "$tmp_atomic/.nightshift.json"
+pc_merge="$(cat "$tmp_atomic/.nightshift.json")"
+merged_atomic="$(echo "$pc_merge" | jq \
+    --arg prov "azuredevops" \
+    --arg org "contoso" \
+    --arg project "Fabrikam" \
+    --arg rep "R1" \
+    '.provider = $prov | .ado_org = $org | .ado_project = $project | .ado_repo = $rep')"
+_repo_write_nightshift_json_atomic "$tmp_atomic" "$(echo "$merged_atomic" | jq -c .)"
+out_atomic="$(cat "$tmp_atomic/.nightshift.json")"
+[[ "$(echo "$out_atomic" | jq -r '.foo')" == "keep" ]] || fail "ADO identity merge should preserve unrelated top-level keys"
+[[ "$(echo "$out_atomic" | jq -r '.agents.bugs')" == "claude" ]] || fail "ADO identity merge should preserve nested unrelated keys"
+[[ "$(echo "$out_atomic" | jq -r '.provider')" == "azuredevops" ]] || fail "ADO identity merge should set provider"
+
 # --- provider dispatch (GitHub path via gh stub) ---
 
 tmpbin="$tmp/bin"
