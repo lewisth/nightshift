@@ -80,7 +80,7 @@ p="$(detect_provider "$tmp/ghssh" '{}')"
 
 mkrepo "$tmp/ado" 'https://dev.azure.com/contoso/Fabrikam/_git/FabrikamFiber'
 p="$(detect_provider "$tmp/ado" '{}')"
-[[ "$p" == "azuredevops" ]] || fail "ado modern: $p"
+[[ "$p" == "unknown" ]] || fail "ado without pinned provider must be unknown, not inferred: $p"
 
 mkrepo "$tmp/unk" 'https://gitlab.com/group/project.git'
 p="$(detect_provider "$tmp/unk" '{}')"
@@ -141,7 +141,17 @@ want=$'PR: GH PR\nPR body here\n---'
 [[ "$out" == "$want" ]] || fail "fetch_open_prs_for_repo github: $out"
 
 if ! create_work_item_for_repo "$tmp/gh" '{}' bugs bugs "[nightshift] T" "B"; then
-  fail "create_work_item_for_repo github path should succeed"
+    fail "create_work_item_for_repo github path should succeed"
 fi
+
+mkrepo "$tmp/adoBare" 'https://dev.azure.com/contoso/Fabrikam/_git/FabrikamFiber'
+if fetch_open_issues_for_repo "$tmp/adoBare" '{}' 2>"$tmp/errAdoBare"; then
+    fail "ado remote without provider=azuredevops should fail fetch_open_issues_for_repo"
+fi
+grep -q "nightshift init" "$tmp/errAdoBare" || fail "expected init hint stderr: $(cat "$tmp/errAdoBare")"
+if create_work_item_for_repo "$tmp/adoBare" '{}' bugs bugs "[nightshift] T" "B" 2>"$tmp/errCwiBare"; then
+    fail "ado remote without config should fail create_work_item_for_repo"
+fi
+grep -q "nightshift init" "$tmp/errCwiBare" || fail "create_work_item ado bare stderr: $(cat "$tmp/errCwiBare")"
 
 echo "OK: provider detection tests passed"

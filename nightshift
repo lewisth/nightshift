@@ -319,12 +319,30 @@ parse_ado_remote() {
         '{org: $org, project: $project, repo: $repo}'
 }
 
+# True if origin URL parses as Azure DevOps (init/discovery only — not a substitute for saved .provider).
+git_origin_matches_azure_devops() {
+    local repo_dir="${1-}"
+    local remote_url normalized
+    remote_url="$(git -C "$repo_dir" remote get-url origin 2>/dev/null || true)"
+    normalized="$(strip_remote_credentials "$remote_url")"
+    [[ -n "$normalized" ]] && parse_ado_remote "$normalized" &>/dev/null
+}
+
 # Reads git remote get-url origin for repo_dir. Prints github, azuredevops, or unknown.
 # Optional repo_config JSON may override .provider (github|azuredevops|unknown only).
+# Azure DevOps is never inferred from the URL alone: .provider must be "azuredevops" in .nightshift.json.
 detect_provider() {
     local repo_dir="$1"
     local repo_config="${2-}"
     [[ -z "$repo_config" ]] && repo_config="{}"
+
+    local override
+    override="$(echo "$repo_config" | jq -r '.provider // empty' 2>/dev/null || true)"
+    if [[ -n "$override" ]] && [[ "$override" != "null" ]]; then
+        case "$override" in
+            github|azuredevops|unknown) echo "$override"; return 0 ;;
+        esac
+    fi
 
     local remote_url normalized
     remote_url="$(git -C "$repo_dir" remote get-url origin 2>/dev/null || true)"
@@ -335,16 +353,8 @@ detect_provider() {
         if [[ "$normalized" == *"github.com"* ]]; then
             detected="github"
         elif parse_ado_remote "$normalized" &>/dev/null; then
-            detected="azuredevops"
+            detected="unknown"
         fi
-    fi
-
-    local override
-    override="$(echo "$repo_config" | jq -r '.provider // empty' 2>/dev/null || true)"
-    if [[ -n "$override" ]] && [[ "$override" != "null" ]]; then
-        case "$override" in
-            github|azuredevops|unknown) detected="$override" ;;
-        esac
     fi
 
     echo "$detected"
@@ -453,6 +463,11 @@ _repo_write_nightshift_json_atomic() {
 ado_err_invalid_ado_identity() {
     local repo_dir="${2-}"
     echo "Error: ${1} — Configure Azure DevOps identity in repo \"$(basename "${repo_dir}")/.nightshift.json\" (provider, ado_org, ado_project, ado_repo); run \"nightshift init\" to repair." >&2
+}
+
+ado_err_ado_remote_not_configured() {
+    local repo_dir="${2-}"
+    echo "Error: ${1} — Repository \"$(basename "${repo_dir}")\" has an Azure DevOps git origin but .nightshift.json does not pin provider=\"azuredevops\" with saved org/project/repository/work item identity — run \"nightshift init\" to configure." >&2
 }
 
 # Ensures explicit saved identity matches git remote when parseable; returns resolved JSON or fails with stderr (repo_dir, repo_config, human label).
@@ -1142,9 +1157,13 @@ fetch_open_issues_for_repo() {
     provider="$(detect_provider "$repo_dir" "$repo_config")"
     if [[ "$provider" == "azuredevops" ]]; then
         fetch_ado_work_items "$repo_dir" "$repo_config"
-    else
-        fetch_open_issues "$repo_dir"
+        return $?
     fi
+    if git_origin_matches_azure_devops "$repo_dir"; then
+        ado_err_ado_remote_not_configured "Listing work items for Azure DevOps" "$repo_dir"
+        return 1
+    fi
+    fetch_open_issues "$repo_dir"
 }
 
 fetch_open_prs_for_repo() {
@@ -1156,9 +1175,13 @@ fetch_open_prs_for_repo() {
     provider="$(detect_provider "$repo_dir" "$repo_config")"
     if [[ "$provider" == "azuredevops" ]]; then
         fetch_ado_prs "$repo_dir" "$repo_config"
-    else
-        fetch_open_prs "$repo_dir"
+        return $?
     fi
+    if git_origin_matches_azure_devops "$repo_dir"; then
+        ado_err_ado_remote_not_configured "Listing pull requests for Azure DevOps" "$repo_dir"
+        return 1
+    fi
+    fetch_open_prs "$repo_dir"
 }
 
 create_work_item_for_repo() {
@@ -1174,9 +1197,13 @@ create_work_item_for_repo() {
     provider="$(detect_provider "$repo_dir" "$repo_config")"
     if [[ "$provider" == "azuredevops" ]]; then
         create_ado_work_item "$repo_dir" "$repo_config" "$agent" "$title" "$body"
-    else
-        create_github_issue "$repo_dir" "$title" "$agent_label" "$body"
+        return $?
     fi
+    if git_origin_matches_azure_devops "$repo_dir"; then
+        ado_err_ado_remote_not_configured "Cannot create Azure DevOps work item" "$repo_dir"
+        return 1
+    fi
+    create_github_issue "$repo_dir" "$title" "$agent_label" "$body"
 }
 
 is_duplicate() {
@@ -1281,7 +1308,8 @@ ${description}"
             ISSUES_CREATED=$((ISSUES_CREATED + 1))
         else
             ERRORS=$((ERRORS + 1))
-            if [[ "$(detect_provider "$repo_dir" "$repo_config")" == "azuredevops" ]]; then
+            if [[ "$(detect_provider "$repo_dir" "$repo_config")" == "azuredevops" ]] \
+                || git_origin_matches_azure_devops "$repo_dir"; then
                 record_run_error api "$(basename "$repo_dir")" "Failed to create Azure DevOps work item"
             fi
         fi
@@ -1348,6 +1376,13 @@ cmd_run() {
                 scan_org="$(echo "$scan_meta" | jq -r '.org // empty')"
                 ado_repos_qualified="${ado_repos_qualified}${repo_dir_scan}|${scan_org}"$'\n'
             fi
+        elif [[ "$scan_provider" == "github" ]]; then
+            need_github=true
+        elif git_origin_matches_azure_devops "$repo_dir_scan"; then
+            log "Error: $(basename "$repo_dir_scan") has an Azure DevOps origin but is not configured (provider and saved identity) — run \"nightshift init\"."
+            record_run_error auth "$(basename "$repo_dir_scan")" "Azure DevOps remote without saved per-repo provider and identity"
+            skip_repos="${skip_repos}${repo_dir_scan}"$'\n'
+            ERRORS=$((ERRORS + 1))
         else
             need_github=true
         fi
@@ -1526,7 +1561,7 @@ cmd_init_process_ado_repos() {
             pc="$(cat "$repo_dir/.nightshift.json")"
         fi
         pv="$(detect_provider "$repo_dir" "$pc")"
-        if [[ "$pv" != "azuredevops" ]]; then
+        if [[ "$pv" != "azuredevops" ]] && ! git_origin_matches_azure_devops "$repo_dir"; then
             continue
         fi
 
@@ -1551,9 +1586,15 @@ cmd_init_process_ado_repos() {
             fi
         else
             if [[ "$sug" != "null" ]]; then
-                org="$(echo "$sug" | jq -r '.org')"
-                project="$(echo "$sug" | jq -r '.project')"
-                reponame="$(echo "$sug" | jq -r '.repo')"
+                local sug_line use_sug
+                sug_line="$(echo "$sug" | jq -r '.org + "/" + .project + "/" + .repo')"
+                read -r -p "  Use Azure DevOps identity from git origin (${sug_line})? [Y/n]: " use_sug || use_sug=""
+                use_sug="${use_sug:-Y}"
+                if [[ "$use_sug" == "y" ]] || [[ "$use_sug" == "Y" ]]; then
+                    org="$(echo "$sug" | jq -r '.org')"
+                    project="$(echo "$sug" | jq -r '.project')"
+                    reponame="$(echo "$sug" | jq -r '.repo')"
+                fi
             fi
             local o_in p_in r_in
             while [[ -z "$org" ]]; do
@@ -1712,7 +1753,7 @@ init_wit_to_short_label() {
     esac
 }
 
-# Returns 0 if any repo under root (discover_repos) has detect_provider == azuredevops
+# Returns 0 if any repo under root has explicit ADO provider or an Azure DevOps git origin.
 init_root_has_ado_repos() {
     local root="$1"
     if [[ ! -d "$root" ]]; then
@@ -1727,7 +1768,7 @@ init_root_has_ado_repos() {
             pc="$(cat "$repo_line/.nightshift.json")"
         fi
         pv="$(detect_provider "$repo_line" "$pc")"
-        if [[ "$pv" == "azuredevops" ]]; then
+        if [[ "$pv" == "azuredevops" ]] || git_origin_matches_azure_devops "$repo_line"; then
             return 0
         fi
     done <<< "$repos_preview"
@@ -1781,9 +1822,12 @@ cmd_init() {
             pc="$(cat "$repo_line/.nightshift.json")"
         fi
         pv="$(detect_provider "$repo_line" "$pc")"
-        if [[ "$pv" == "azuredevops" ]]; then
+        if [[ "$pv" == "azuredevops" ]] || git_origin_matches_azure_devops "$repo_line"; then
             has_ado=true
-        else
+        fi
+        if [[ "$pv" == "github" ]]; then
+            need_github=true
+        elif [[ "$pv" == "unknown" ]] && ! git_origin_matches_azure_devops "$repo_line"; then
             need_github=true
         fi
     done <<< "$repos_preview"
@@ -1815,7 +1859,7 @@ cmd_init() {
             if [[ -f "$repo_line/.nightshift.json" ]]; then
                 pc="$(cat "$repo_line/.nightshift.json")"
             fi
-            if [[ "$(detect_provider "$repo_line" "$pc")" != "azuredevops" ]]; then
+            if [[ "$(detect_provider "$repo_line" "$pc")" != "azuredevops" ]] && ! git_origin_matches_azure_devops "$repo_line"; then
                 continue
             fi
             org="$(ado_org_for_pat_probe "$repo_line" "$pc")"
@@ -1934,7 +1978,7 @@ cmd_init() {
                 rcfg="$(cat "$repo_dir/.nightshift.json")"
             fi
             prov="$(detect_provider "$repo_dir" "$rcfg")"
-            if [[ "$prov" == "azuredevops" ]]; then
+            if [[ "$prov" == "azuredevops" ]] || git_origin_matches_azure_devops "$repo_dir"; then
                 continue
             fi
 

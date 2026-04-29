@@ -3,3 +3,4 @@
 # Started: 2026-04-29T07:34:41Z
 
 #21 (2026-04-29): ADO identity is config-only (provider + ado_org/project/repo), drift vs origin errors at runtime, interactive init repair and atomic .nightshift.json writes; reject builtin Task (exact, trimmed) while allowing custom types containing "task"; ado_work_item_type required for create (no global/PBI fallback); tests updated.
+#21 (2026-04-29): Stopped inferring azuredevops from git URL in detect_provider; added git_origin_matches_azure_devops for init/discovery; ADO fetch/create block with init hint when origin is ADO but provider not saved; cmd_run preflight skips misconfigured ADO without requiring gh; init asks before applying origin-suggested org/project/repo; provider tests extended.
