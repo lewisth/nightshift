@@ -499,6 +499,29 @@ ado_require_saved_identity_runtime() {
     resolved_ado_metadata "$repo_dir" "$repo_config"
 }
 
+# Prints trimmed ado_work_item_type on stdout. Fails with stderr if missing, whitespace-only, or built-in Task (trim + case-fold).
+ado_require_saved_work_item_type_runtime() {
+    local repo_dir="${1-}"
+    local repo_config="${2-}"
+    local ctx="${3-Work item type}"
+    [[ -z "$repo_config" ]] && repo_config="{}"
+
+    local wit_type
+    wit_type="$(echo "$repo_config" | jq -r '.ado_work_item_type // empty' 2>/dev/null)" || wit_type=""
+    wit_type="$(echo "$wit_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+    if [[ -z "$wit_type" ]] || [[ "$wit_type" == "null" ]]; then
+        echo "Error: ${ctx}: ado_work_item_type is missing or whitespace-only in repo \"$(basename "${repo_dir}")/.nightshift.json\" — run \"nightshift init\"." >&2
+        return 1
+    fi
+    if ado_wit_name_is_forbidden_builtin_task "$wit_type"; then
+        echo "Error: ${ctx}: built-in Azure DevOps Task work item type is not allowed — choose another type in \"$(basename "${repo_dir}")/.nightshift.json\"; run \"nightshift init\"." >&2
+        return 1
+    fi
+    printf '%s\n' "$wit_type"
+    return 0
+}
+
 # --- Azure DevOps REST (api-version=7.1) ---
 
 # Ensures NIGHTSHIFT_ADO_PAT is set. Prints to stderr and returns 1 if missing.
@@ -784,15 +807,7 @@ create_ado_work_item() {
     org="$(echo "$meta" | jq -r '.org // empty')"
     project="$(echo "$meta" | jq -r '.project // empty')"
     repo="$(echo "$meta" | jq -r '.repo // empty')"
-    wit_type="$(echo "$repo_config" | jq -r '.ado_work_item_type // empty' 2>/dev/null)"
-    wit_type="$(echo "$wit_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-
-    if [[ -z "$wit_type" ]] || [[ "$wit_type" == "null" ]]; then
-        echo "Error: Cannot create Azure DevOps work item: ado_work_item_type is missing in repo .nightshift.json — run \"nightshift init\"." >&2
-        return 1
-    fi
-    if ado_wit_name_is_forbidden_builtin_task "$wit_type"; then
-        echo "Error: Cannot create Azure DevOps work item: built-in Task work item type is not allowed." >&2
+    if ! wit_type="$(ado_require_saved_work_item_type_runtime "$repo_dir" "$repo_config" "Cannot create work item")"; then
         return 1
     fi
 
@@ -1388,8 +1403,16 @@ cmd_run() {
                 skip_repos="${skip_repos}${repo_dir_scan}"$'\n'
                 ERRORS=$((ERRORS + 1))
             else
-                scan_org="$(echo "$scan_meta" | jq -r '.org // empty')"
-                ado_repos_qualified="${ado_repos_qualified}${repo_dir_scan}|${scan_org}"$'\n'
+                if ! scan_wit="$(ado_require_saved_work_item_type_runtime "$repo_dir_scan" "$scan_config" "Run preflight")"; then
+                    log "Error: Azure DevOps work item type missing or invalid for $(basename "$repo_dir_scan") — run \"nightshift init\" to set ado_work_item_type (built-in Task is not allowed)."
+                    record_run_error auth "$(basename "$repo_dir_scan")" "Azure DevOps ado_work_item_type missing, whitespace-only, or forbidden built-in Task"
+                    skip_repos="${skip_repos}${repo_dir_scan}"$'\n'
+                    ERRORS=$((ERRORS + 1))
+                else
+                    scan_org="$(echo "$scan_meta" | jq -r '.org // empty')"
+                    ado_repos_qualified="${ado_repos_qualified}${repo_dir_scan}|${scan_org}"$'\n'
+                fi
+                unset scan_wit
             fi
         elif [[ "$scan_provider" == "github" ]]; then
             need_github=true

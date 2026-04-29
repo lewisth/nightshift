@@ -22,3 +22,5 @@
 #21 (2026-04-29): Issue #21 closed out: explicit `.provider`/ADO identity in `.nightshift.json` as runtime SOT, builtin `Task` rejected (exact trim+case-fold), drift/missing fails with init repair, atomic jq-merge writes via `_repo_write_nightshift_json_atomic`, GitHub paths unchanged. Ran `./tests/run_provider_tests.sh`, `./tests/run_ado_tests.sh`, `./tests/run_agent_loop_tests.sh` — all passed.
 
 #21 (2026-04-29): Re-verified #21 against current `nightshift` (explicit per-repo ADO identity + work item type, no runtime inference from remotes/defaults for API paths; Task forbidden everywhere relevant). Ran `./tests/run_provider_tests.sh`, `./tests/run_ado_tests.sh`, `./tests/run_agent_loop_tests.sh` — all passed. shellcheck unavailable locally.
+
+#21 (2026-04-29): Added `ado_require_saved_work_item_type_runtime` (trimmed non-empty `ado_work_item_type`, reject built-in Task); `create_ado_work_item` and `cmd_run` preflight use it so ADO runs fail early without inferred WIT defaults. Extended `run_provider_tests.sh`. Ran `./tests/run_provider_tests.sh`, `./tests/run_ado_tests.sh`, `./tests/run_agent_loop_tests.sh` — all passed.

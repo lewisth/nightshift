@@ -129,6 +129,24 @@ if ado_require_saved_identity_runtime "$tmp/driftADO" "$drift_cfg" "Test" 2>"$tm
 fi
 grep -Fq "does not match origin remote (drift)" "$tmp/drift.err" || fail "expected drift stderr, got $(cat "$tmp/drift.err")"
 
+id_no_wit="$(jq -nc '{provider:"azuredevops",ado_org:"contoso",ado_project:"Fabrikam",ado_repo:"FabrikamFiber"}')"
+if wit_out="$(ado_require_saved_work_item_type_runtime "$tmp/driftADO" "$id_no_wit" "Test" 2>"$tmp/witmiss.err")"; then
+    fail "missing ado_work_item_type should fail, got stdout: $wit_out"
+fi
+grep -Fq "ado_work_item_type is missing" "$tmp/witmiss.err" || fail "expected missing WIT stderr: $(cat "$tmp/witmiss.err")"
+
+task_wit_cfg="$(jq -nc '{provider:"azuredevops",ado_org:"contoso",ado_project:"Fabrikam",ado_repo:"FabrikamFiber",ado_work_item_type:"  task "}')"
+if ado_require_saved_work_item_type_runtime "$tmp/driftADO" "$task_wit_cfg" "Test" 2>"$tmp/wittask.err"; then
+    fail "saved built-in Task work item type should fail preflight"
+fi
+grep -Fq "Task work item type is not allowed" "$tmp/wittask.err" || fail "expected Task rejection stderr: $(cat "$tmp/wittask.err")"
+
+bug_wit_cfg="$(jq -nc '{provider:"azuredevops",ado_org:"contoso",ado_project:"Fabrikam",ado_repo:"FabrikamFiber",ado_work_item_type:" Bug "}')"
+if ! wit_norm="$(ado_require_saved_work_item_type_runtime "$tmp/driftADO" "$bug_wit_cfg" "Test")"; then
+    fail "explicit Bug WIT should pass"
+fi
+[[ "$wit_norm" == "Bug" ]] || fail "expected trimmed Bug, got $wit_norm"
+
 p="$(ado_org_for_pat_probe "{}")"
 [[ -z "$p" ]] || fail "PAT probe org must be empty without saved ADO identity (no git inference)"
 p="$(ado_org_for_pat_probe "$(jq -nc '{provider:"azuredevops",ado_org:"contoso",ado_project:"Fabrikam",ado_repo:"R1"}')")"
