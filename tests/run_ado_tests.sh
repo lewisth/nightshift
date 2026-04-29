@@ -521,6 +521,11 @@ if [[ "$(echo "$out" | jq 'length')" != "1" ]]; then
   fail "fetch required fields json: $out"
 fi
 
+if ado_fetch_wit_required_fields_json "contoso" "Fabrikam" "  TaSk " 2>"$errdir/errwitTask"; then
+  fail "ado_fetch_wit_required_fields_json should reject built-in Task (trimmed, case-fold)"
+fi
+grep -q "not allowed" "$errdir/errwitTask" || fail "Task rejection message: $(cat "$errdir/errwitTask")"
+
 cfg_ok='{"ado_work_item_type":"Bug","ado_fields":{"Custom.Req":"v1"}}'
 req_one='[{"referenceName":"Custom.Req","name":"Custom Req"}]'
 if ! init_ado_repo_fully_configured "$cfg_ok" "$req_one" "Bug"; then

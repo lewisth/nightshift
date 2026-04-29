@@ -111,6 +111,14 @@ if ! wit="$(init_normalize_work_item_type_choice "My Task Story")"; then
 fi
 [[ "$wit" == "My Task Story" ]] || fail "expected custom wit, got $wit"
 
+# --- ado_require_saved_identity_runtime: drift vs git origin ---
+mkrepo "$tmp/driftADO" 'https://dev.azure.com/contoso/Fabrikam/_git/FabrikamFiber'
+drift_cfg="$(jq -nc '{provider:"azuredevops",ado_org:"wrongorg",ado_project:"Fabrikam",ado_repo:"FabrikamFiber"}')"
+if ado_require_saved_identity_runtime "$tmp/driftADO" "$drift_cfg" "Test" 2>"$tmp/drift.err"; then
+    fail "saved identity that disagrees with origin should fail drift check"
+fi
+grep -Fq "does not match origin remote (drift)" "$tmp/drift.err" || fail "expected drift stderr, got $(cat "$tmp/drift.err")"
+
 # --- provider dispatch (GitHub path via gh stub) ---
 
 tmpbin="$tmp/bin"
