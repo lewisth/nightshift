@@ -84,3 +84,5 @@
 #21 (2026-04-29): Issue #21 — Confirmed acceptance criteria against current `nightshift`; no further implementation needed. Ran `bash -n nightshift`, `./tests/run_provider_tests.sh`, `./tests/run_ado_tests.sh`, `./tests/run_agent_loop_tests.sh` (all passed). Bash-only repo — no separate package typecheck.
 
 #21 (2026-04-29): Verified Issue #21 baseline (explicit ADO provider/org/project/repo + `ado_work_item_type` in `.nightshift.json`; no runtime WIT fallback from user config; builtin Task blocked via trim+case-fold exact match; drift/missing invalid with `nightshift init`; atomic `_repo_write_nightshift_json_atomic`). Ran `bash -n nightshift`, `./tests/run_provider_tests.sh`, `./tests/run_ado_tests.sh`, `./tests/run_agent_loop_tests.sh` — all passed.
+
+#21 (2026-04-29): Issue #21 — Re-ran `bash -n nightshift`, `./tests/run_provider_tests.sh`, `./tests/run_ado_tests.sh`, `./tests/run_agent_loop_tests.sh` (all OK). Branch already implements explicit ADO identity + per-repo WIT as runtime SOT, Task rejection (exact trimmed case-fold), init drift repair, atomic repo JSON writes; GitHub unchanged. Bash-only — no package typecheck.
