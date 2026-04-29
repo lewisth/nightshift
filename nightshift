@@ -373,6 +373,9 @@ ado_wit_name_is_forbidden_builtin_task() {
 ado_repo_config_has_policy_compliant_work_item_type() {
     local cfg="${1-}"
     [[ -z "$cfg" ]] && cfg="{}"
+    if ! echo "$cfg" | jq -e '(.ado_work_item_type | type == "string")' &>/dev/null; then
+        return 1
+    fi
     local wit_type
     wit_type="$(echo "$cfg" | jq -r '.ado_work_item_type // empty' 2>/dev/null)" || wit_type=""
     wit_type="$(echo "$wit_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
@@ -521,6 +524,16 @@ ado_require_saved_work_item_type_runtime() {
     local repo_config="${2-}"
     local ctx="${3-Work item type}"
     [[ -z "$repo_config" ]] && repo_config="{}"
+
+    if echo "$repo_config" | jq -e 'has("ado_work_item_type") and (.ado_work_item_type | type != "string")' &>/dev/null; then
+        echo "Error: ${ctx}: ado_work_item_type must be a JSON string in repo \"$(basename "${repo_dir}")/.nightshift.json\" — run \"nightshift init\"." >&2
+        return 1
+    fi
+
+    if ! echo "$repo_config" | jq -e '(.ado_work_item_type | type == "string")' &>/dev/null; then
+        echo "Error: ${ctx}: ado_work_item_type is missing or whitespace-only in repo \"$(basename "${repo_dir}")/.nightshift.json\" — run \"nightshift init\"." >&2
+        return 1
+    fi
 
     local wit_type
     wit_type="$(echo "$repo_config" | jq -r '.ado_work_item_type // empty' 2>/dev/null)" || wit_type=""
@@ -900,6 +913,7 @@ _ado_work_items_abort_or_empty() {
 # fetch_ado_work_items <repo_dir> [repo_config_json]
 # Newline-separated titles of non-Closed, non-Done work items tagged nightshift and nightshift-repo:{repo}.
 # Same shape as fetch_open_issues. On error or missing PAT/metadata, returns empty string (errors on stderr).
+# Requires the same explicit per-repo ado_work_item_type policy as create (no partial ADO config at runtime).
 # When NIGHTSHIFT_ADO_STRICT is set (cmd_run), returns non-zero on those failures.
 fetch_ado_work_items() {
     local repo_dir="$1"
@@ -913,6 +927,10 @@ fetch_ado_work_items() {
 
     local meta org project repo
     if ! meta="$(ado_require_saved_identity_runtime "$repo_dir" "$repo_config" "Listing work items")"; then
+        _ado_work_items_abort_or_empty
+        return
+    fi
+    if ! ado_require_saved_work_item_type_runtime "$repo_dir" "$repo_config" "Listing work items" >/dev/null; then
         _ado_work_items_abort_or_empty
         return
     fi
@@ -984,6 +1002,7 @@ _ado_prs_abort_or_none() {
 # fetch_ado_prs <repo_dir> [repo_config_json]
 # Active PRs via GET .../repositories/.../pullrequests?searchCriteria.status=active. Same text shape as fetch_open_prs
 # (PR: title, body, ---). Prints "None" if there are no active PRs, on API error, or if metadata/PAT is missing.
+# Requires explicit per-repo ado_work_item_type (same policy as work item create/list).
 # When NIGHTSHIFT_ADO_STRICT is set, returns non-zero on PAT/metadata/API failure (cmd_run only).
 fetch_ado_prs() {
     local repo_dir="$1"
@@ -997,6 +1016,10 @@ fetch_ado_prs() {
 
     local meta org project reponame
     if ! meta="$(ado_require_saved_identity_runtime "$repo_dir" "$repo_config" "Listing pull requests")"; then
+        _ado_prs_abort_or_none
+        return
+    fi
+    if ! ado_require_saved_work_item_type_runtime "$repo_dir" "$repo_config" "Listing pull requests" >/dev/null; then
         _ado_prs_abort_or_none
         return
     fi
@@ -1134,6 +1157,9 @@ init_normalize_work_item_type_choice() {
 # Returns 0 if ado_work_item_type matches and ado_fields contains a non-empty string for each required referenceName.
 init_ado_repo_fully_configured() {
     local cfg="${1-}" required_json="${2-}" wit="${3-}"
+    if ! echo "$cfg" | jq -e '(.ado_work_item_type | type == "string")' &>/dev/null; then
+        return 1
+    fi
     local saved_type wit_trim
     saved_type="$(echo "$cfg" | jq -r '.ado_work_item_type // empty' 2>/dev/null)" || saved_type=""
     saved_type="$(echo "$saved_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"

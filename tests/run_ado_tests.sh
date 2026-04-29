@@ -90,7 +90,7 @@ fail() {
   exit 1
 }
 
-ADO_TEST_IDENTITY="$(jq -nc '{provider:"azuredevops",ado_org:"contoso",ado_project:"Fabrikam",ado_repo:"FabrikamFiber"}')"
+ADO_TEST_IDENTITY="$(jq -nc '{provider:"azuredevops",ado_org:"contoso",ado_project:"Fabrikam",ado_repo:"FabrikamFiber",ado_work_item_type:"Bug"}')"
 
 # --- require_ado_pat / missing PAT ---
 
@@ -247,6 +247,21 @@ if [[ -n "$out" ]]; then
   fail "API error should yield empty titles"
 fi
 
+id_no_wit="$(jq -nc '{provider:"azuredevops",ado_org:"contoso",ado_project:"Fabrikam",ado_repo:"FabrikamFiber"}')"
+export NIGHTSHIFT_MOCK_HTTP_CODE=200
+unset NIGHTSHIFT_MOCK_STATE NIGHTSHIFT_MOCK_BODY
+out="$(fetch_ado_work_items "$tmp_root/adowiql" "$id_no_wit" 2>"$errdir/errfetchnowit" || true)"
+if [[ -n "$out" ]]; then
+  fail "fetch work items without ado_work_item_type should yield empty, got: $out"
+fi
+grep -Fq "ado_work_item_type" "$errdir/errfetchnowit" || fail "expected WIT error stderr: $(cat "$errdir/errfetchnowit")"
+
+export NIGHTSHIFT_ADO_STRICT=1
+if fetch_ado_work_items "$tmp_root/adowiql" "$id_no_wit" 2>"$errdir/errfetchnowitstrict"; then
+  fail "strict: fetch work items without ado_work_item_type should fail"
+fi
+unset NIGHTSHIFT_ADO_STRICT
+
 # --- fetch_ado_prs ---
 
 unset NIGHTSHIFT_ADO_PAT
@@ -294,6 +309,18 @@ if [[ "$out" != "None" ]]; then
   fail "PR API error should yield None, got: $out"
 fi
 
+out="$(fetch_ado_prs "$tmp_root/adoprs" "$id_no_wit" 2>"$errdir/errprsnowit" || true)"
+if [[ "$out" != "None" ]]; then
+  fail "fetch PRs without ado_work_item_type should yield None, got: $out"
+fi
+grep -Fq "ado_work_item_type" "$errdir/errprsnowit" || fail "expected PR WIT stderr: $(cat "$errdir/errprsnowit")"
+
+export NIGHTSHIFT_ADO_STRICT=1
+if fetch_ado_prs "$tmp_root/adoprs" "$id_no_wit" 2>"$errdir/errprsnowitstrict"; then
+  fail "strict: fetch PRs without ado_work_item_type should fail"
+fi
+unset NIGHTSHIFT_ADO_STRICT
+
 # --- create_ado_work_item (fresh HOME so ~/.nightshift/config.json is test-controlled) ---
 
 ado_bash() {
@@ -338,7 +365,7 @@ if ! grep -q "identity incomplete" "$errdir/errcwi1"; then
   fail "expected incomplete ADO identity error: $(cat "$errdir/errcwi1")"
 fi
 
-if ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/adowiql\" $(printf '%q' "$ADO_TEST_IDENTITY") bugs \"[nightshift] NoWit\" \"D\"" 2>"$errdir/errcwi_nowit"; then
+if ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/adowiql\" $(printf '%q' "$id_no_wit") bugs \"[nightshift] NoWit\" \"D\"" 2>"$errdir/errcwi_nowit"; then
   fail "create should require per-repo ado_work_item_type; must not fall back to user ado_default_work_item_type"
 fi
 if ! grep -q "ado_work_item_type is missing" "$errdir/errcwi_nowit"; then

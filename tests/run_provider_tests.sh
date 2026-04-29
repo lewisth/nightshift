@@ -169,6 +169,20 @@ if ! ado_repo_config_has_policy_compliant_work_item_type "$wit_sub_cfg"; then
     fail "policy WIT should allow custom type whose name contains task"
 fi
 
+wit_num_cfg="$(jq -nc '{provider:"azuredevops",ado_org:"contoso",ado_project:"Fabrikam",ado_repo:"R1",ado_work_item_type:42}')"
+if ado_repo_config_has_policy_compliant_work_item_type "$wit_num_cfg"; then
+    fail "policy WIT should reject non-string ado_work_item_type"
+fi
+if ado_require_saved_work_item_type_runtime "$tmp/driftADO" "$wit_num_cfg" "Test" 2>"$tmp/witnum.err"; then
+    fail "runtime WIT should reject numeric ado_work_item_type"
+fi
+grep -Fq "JSON string" "$tmp/witnum.err" || fail "expected non-string WIT stderr: $(cat "$tmp/witnum.err")"
+
+req_one='[{"referenceName":"Custom.Req","name":"Custom Req"}]'
+if init_ado_repo_fully_configured "$(jq -nc '{ado_work_item_type:42,"ado_fields":{"Custom.Req":"x"}}')" "$req_one" "Bug"; then
+    fail "init_ado_repo_fully_configured should reject non-string saved type"
+fi
+
 # --- provider dispatch (GitHub path via gh stub) ---
 
 tmpbin="$tmp/bin"
