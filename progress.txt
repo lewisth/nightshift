@@ -43,3 +43,4 @@
 
 #21 (2026-04-29): Issue #21 verified on branch nightshift/batch-20260429-075306 — explicit `.nightshift.json` ADO provider/org/project/repo + `ado_work_item_type` as runtime SOT; builtin Task blocked via `ado_wit_name_is_forbidden_builtin_task` (trim + case-fold exact match); drift/missing identity fails with init repair; atomic `_repo_write_nightshift_json_atomic`. Ran `bash -n nightshift`, `./tests/run_provider_tests.sh`, `./tests/run_ado_tests.sh`, `./tests/run_agent_loop_tests.sh` (all passed). Bash-only repo — no TS typecheck.
 
+#21 (2026-04-29): Added `ado_repo_config_has_policy_compliant_work_item_type`; `nightshift status` shows invalid `ado_work_item_type` when identity is saved but WIT is missing/whitespace/forbidden built-in Task (drift still takes precedence). Tests in `run_provider_tests.sh`. Ran `bash -n nightshift`, `./tests/run_provider_tests.sh`, `./tests/run_ado_tests.sh`, `./tests/run_agent_loop_tests.sh`.

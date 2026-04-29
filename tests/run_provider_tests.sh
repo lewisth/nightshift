@@ -152,6 +152,23 @@ p="$(ado_org_for_pat_probe "{}")"
 p="$(ado_org_for_pat_probe "$(jq -nc '{provider:"azuredevops",ado_org:"contoso",ado_project:"Fabrikam",ado_repo:"R1"}')")"
 [[ "$p" == "contoso" ]] || fail "PAT probe org should come from saved ado_org only, got: $p"
 
+wit_ok_cfg="$(jq -nc '{provider:"azuredevops",ado_org:"contoso",ado_project:"Fabrikam",ado_repo:"R1",ado_work_item_type:"Bug"}')"
+if ! ado_repo_config_has_policy_compliant_work_item_type "$wit_ok_cfg"; then
+    fail "policy WIT should pass for Bug"
+fi
+wit_miss_cfg="$(jq -nc '{provider:"azuredevops",ado_org:"contoso",ado_project:"Fabrikam",ado_repo:"R1"}')"
+if ado_repo_config_has_policy_compliant_work_item_type "$wit_miss_cfg"; then
+    fail "policy WIT should fail when ado_work_item_type missing"
+fi
+wit_task_cfg="$(jq -nc '{provider:"azuredevops",ado_org:"contoso",ado_project:"Fabrikam",ado_repo:"R1",ado_work_item_type:"  TaSk " }')"
+if ado_repo_config_has_policy_compliant_work_item_type "$wit_task_cfg"; then
+    fail "policy WIT should reject built-in Task (trim + case-fold)"
+fi
+wit_sub_cfg="$(jq -nc '{provider:"azuredevops",ado_org:"contoso",ado_project:"Fabrikam",ado_repo:"R1",ado_work_item_type:"My CustomerTask"}')"
+if ! ado_repo_config_has_policy_compliant_work_item_type "$wit_sub_cfg"; then
+    fail "policy WIT should allow custom type whose name contains task"
+fi
+
 # --- provider dispatch (GitHub path via gh stub) ---
 
 tmpbin="$tmp/bin"

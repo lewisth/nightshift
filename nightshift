@@ -369,6 +369,22 @@ ado_wit_name_is_forbidden_builtin_task() {
     [[ "$lower" == "task" ]]
 }
 
+# True when .ado_work_item_type is non-empty after trim and is not the forbidden built-in Task (matches runtime rules).
+ado_repo_config_has_policy_compliant_work_item_type() {
+    local cfg="${1-}"
+    [[ -z "$cfg" ]] && cfg="{}"
+    local wit_type
+    wit_type="$(echo "$cfg" | jq -r '.ado_work_item_type // empty' 2>/dev/null)" || wit_type=""
+    wit_type="$(echo "$wit_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [[ -z "$wit_type" ]] || [[ "$wit_type" == "null" ]]; then
+        return 1
+    fi
+    if ado_wit_name_is_forbidden_builtin_task "$wit_type"; then
+        return 1
+    fi
+    return 0
+}
+
 # Source of truth at runtime: provider + ado_org/ado_project/ado_repo in .nightshift.json only (trimmed). No git-remote merge.
 resolved_ado_metadata() {
     local repo_dir="${1-}"
@@ -2168,6 +2184,8 @@ cmd_status() {
                         sug_status="$(ado_suggested_identity_from_git_remote "$repo_dir")"
                         if [[ "$sug_status" != "null" ]] && ado_identity_drifts_from_git_remote "$repo_dir" "$rcfg" "$sug_status"; then
                             ado_line="${ado_line} [invalid: saved identity differs from git origin]"
+                        elif ! ado_repo_config_has_policy_compliant_work_item_type "$rcfg"; then
+                            ado_line="${ado_line} [invalid: ado_work_item_type missing/whitespace-only or forbidden built-in Task — run \"nightshift init\"]"
                         fi
                     else
                         ado_line=" (Azure DevOps provider set — identity incomplete — run \"nightshift init\")"
