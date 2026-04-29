@@ -18,3 +18,5 @@
 #21 (2026-04-29): Re-verified Issue #21 acceptance; ran tests/run_provider_tests.sh, tests/run_ado_tests.sh, tests/run_agent_loop_tests.sh — all passed.
 
 #21 (2026-04-29): Persist ADO identity to .nightshift.json when init drift repair is accepted (fixes silent disk drift); pre-fill partial ado_org/project/repo in init for incomplete configs; status lists ADO git remotes without pinned provider; trim saved ado_work_item_type in init; create_ado test for custom WIT "My CustomerTask". Ran run_provider_tests, run_ado_tests, run_agent_loop_tests (all OK); shellcheck N/A.
+
+#21 (2026-04-29): Issue #21 closed out: explicit `.provider`/ADO identity in `.nightshift.json` as runtime SOT, builtin `Task` rejected (exact trim+case-fold), drift/missing fails with init repair, atomic jq-merge writes via `_repo_write_nightshift_json_atomic`, GitHub paths unchanged. Ran `./tests/run_provider_tests.sh`, `./tests/run_ado_tests.sh`, `./tests/run_agent_loop_tests.sh` — all passed.
