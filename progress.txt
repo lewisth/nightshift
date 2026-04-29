@@ -23,6 +23,8 @@
 
 #21 (2026-04-29): Re-verified #21 against current `nightshift` (explicit per-repo ADO identity + work item type, no runtime inference from remotes/defaults for API paths; Task forbidden everywhere relevant). Ran `./tests/run_provider_tests.sh`, `./tests/run_ado_tests.sh`, `./tests/run_agent_loop_tests.sh` — all passed. shellcheck unavailable locally.
 
+#21 (2026-04-29): Issue #21 verified: repo already satisfies acceptance (`.nightshift.json` is source of truth for ADO provider/org/project/repo and `ado_work_item_type`; builtin `Task` rejected only when trimmed name equals `task` case-insensitively; drift/missing identity fails with `nightshift init` repair; `_repo_write_nightshift_json_atomic` for atomic ADO config writes). Ran `bash -n nightshift`, `./tests/run_provider_tests.sh`, `./tests/run_ado_tests.sh`, `./tests/run_agent_loop_tests.sh` (all OK). Bash-only — no separate typecheck.
+
 #21 (2026-04-29): Added `ado_require_saved_work_item_type_runtime` (trimmed non-empty `ado_work_item_type`, reject built-in Task); `create_ado_work_item` and `cmd_run` preflight use it so ADO runs fail early without inferred WIT defaults. Extended `run_provider_tests.sh`. Ran `./tests/run_provider_tests.sh`, `./tests/run_ado_tests.sh`, `./tests/run_agent_loop_tests.sh` — all passed.
 
 #21 (2026-04-29): Verified Issue #21 baseline on branch nightshift/batch-20260429-075306 (explicit ADO identity + ado_work_item_type in `.nightshift.json`, drift vs origin fails at runtime, builtin Task rejected trim+case-fold only, atomic `_repo_write_nightshift_json_atomic`, GitHub paths unchanged). Ran `./tests/run_provider_tests.sh`, `./tests/run_ado_tests.sh`, `./tests/run_agent_loop_tests.sh` — all passed; no TS/package typecheck (bash-only repo).
@@ -34,3 +36,6 @@
 #21 (2026-04-29): Issue #21 acceptance satisfied by existing `nightshift` baseline — `.provider` + `ado_org`/`ado_project`/`ado_repo`/`ado_work_item_type` as runtime SOT, no ADO provider inference from URL alone, drift vs origin fails fast, builtin Task rejected (trim + ASCII case-fold equality only), `_repo_write_nightshift_json_atomic` for per-repo writes. Ran `bash -n nightshift`, `./tests/run_provider_tests.sh`, `./tests/run_ado_tests.sh`, `./tests/run_agent_loop_tests.sh` (all OK).
 
 #21 (2026-04-29): Confirmed Issue #21 implementation on `nightshift/batch-20260429-075306`: explicit ADO identity + per-repo `ado_work_item_type` as runtime source of truth, `Task` rejected only when trimmed name equals built-in Task (case-insensitive), drift/missing config invalid with `nightshift init` repair, atomic `.nightshift.json` writes via jq merge. Ran `bash -n nightshift`, `./tests/run_provider_tests.sh`, `./tests/run_ado_tests.sh`, `./tests/run_agent_loop_tests.sh` (all passed). No shellcheck in environment.
+
+#21 (2026-04-29): Session loop: Issue #21 acceptance confirmed on branch; no further code edits. Ran `bash -n nightshift`, `./tests/run_provider_tests.sh`, `./tests/run_ado_tests.sh`, `./tests/run_agent_loop_tests.sh` (passed). refs commit + push.
+
