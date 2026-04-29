@@ -398,6 +398,17 @@ if [[ "$uwi2" != *"%24Bug"* ]] && [[ "$uwi2" != *'$Bug'* ]]; then
   fail "Bug work item URL: $uwi2"
 fi
 
+CUSTOM_TASK_CFG="$(jq -nc --argjson id "$ADO_TEST_IDENTITY" '$id * {ado_work_item_type:"My CustomerTask"}')"
+export NIGHTSHIFT_MOCK_HTTP_CODE=200
+export NIGHTSHIFT_MOCK_BODY='{"id":101,"rev":1}'
+if ! ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/adowiql\" $(printf '%q' "$CUSTOM_TASK_CFG") bugs \"[nightshift] CustomTaskOk\" \"D\""; then
+  fail "custom WIT whose name contains 'task' should be allowed"
+fi
+uwi_ct="$(cat "$urlog")"
+if [[ "$uwi_ct" != *"CustomerTask"* ]]; then
+  fail "expected custom Task-substring WIT in work item URL: $uwi_ct"
+fi
+
 cfg_ws="$(jq -nc --argjson id "$ADO_TEST_IDENTITY" '$id * {ado_work_item_type:"   " }')"
 if ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/adowiql\" $(printf '%q' "$cfg_ws") bugs \"[nightshift] Ws\" \"D\"" 2>"$errdir/errcwi_ws"; then
   fail "whitespace-only ado_work_item_type should be missing"

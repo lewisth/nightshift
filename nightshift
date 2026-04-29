@@ -1597,11 +1597,30 @@ cmd_init_process_ado_repos() {
                     org="$(echo "$sug" | jq -r '.org')"
                     project="$(echo "$sug" | jq -r '.project')"
                     reponame="$(echo "$sug" | jq -r '.repo')"
+                    local pc_drift_fixed
+                    pc_drift_fixed="$(echo "$pc" | jq \
+                        --arg org "$org" \
+                        --arg project "$project" \
+                        --arg rep "$reponame" \
+                        '.ado_org = $org | .ado_project = $project | .ado_repo = $rep')"
+                    _repo_write_nightshift_json_atomic "$repo_dir" "$(echo "$pc_drift_fixed" | jq -c .)"
+                    echo "  $repo_name: saved Azure DevOps identity updated to match git origin"
+                    pc="$pc_drift_fixed"
                 else
                     echo "  $repo_name: keeping saved identity — nightshift will refuse Azure DevOps runs until identity matches \"git remote get-url origin\" or you edit .nightshift.json; run \"nightshift init\" again to replace."
                 fi
             fi
         else
+            org=""
+            project=""
+            reponame=""
+            local org_pc project_pc repo_pc
+            org_pc="$(echo "$pc" | jq -r '.ado_org // ""' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            project_pc="$(echo "$pc" | jq -r '.ado_project // ""' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            repo_pc="$(echo "$pc" | jq -r '.ado_repo // ""' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [[ -n "$org_pc" ]] && org="$org_pc"
+            [[ -n "$project_pc" ]] && project="$project_pc"
+            [[ -n "$repo_pc" ]] && reponame="$repo_pc"
             if [[ "$sug" != "null" ]]; then
                 local sug_line use_sug
                 sug_line="$(echo "$sug" | jq -r '.org + "/" + .project + "/" + .repo')"
@@ -1631,6 +1650,7 @@ cmd_init_process_ado_repos() {
         local wit wit_in saved_type
         wit=""
         saved_type="$(echo "$pc" | jq -r '.ado_work_item_type // empty' 2>/dev/null)" || saved_type=""
+        saved_type="$(echo "$saved_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
         if [[ -n "$saved_type" ]] && [[ "$saved_type" != "null" ]]; then
             if ado_wit_name_is_forbidden_builtin_task "$saved_type"; then
                 echo "  $repo_name: saved work item type is the built-in Task, which is not allowed — choose another type."
@@ -2120,6 +2140,8 @@ cmd_status() {
                         if (.org | type == "string") and (.project | type == "string") and (.repo | type == "string")
                         then " (" + .org + "/" + .project + "/" + .repo + ")"
                         else "" end' 2>/dev/null || true)"
+                elif git_origin_matches_azure_devops "$repo_dir"; then
+                    ado_line=" (Azure DevOps remote — run nightshift init to pin provider and identity)"
                 fi
                 echo "  $(basename "$repo_dir"): $provider${ado_line}"
             done <<< "$(discover_repos "$repos_root")"
