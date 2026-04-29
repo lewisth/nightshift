@@ -350,35 +350,129 @@ detect_provider() {
     echo "$detected"
 }
 
-# ADO org/project/repo from origin URL merged with .nightshift.json ado_* overrides.
+# Strict: built-in Azure DevOps "Task" work item type (trimmed, ASCII case-fold) — not substring matches.
+ado_wit_name_is_forbidden_builtin_task() {
+    local raw="${1-}"
+    raw="$(echo "$raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    local lower
+    lower="$(echo "$raw" | tr '[:upper:]' '[:lower:]')"
+    [[ "$lower" == "task" ]]
+}
+
+# Source of truth at runtime: provider + ado_org/ado_project/ado_repo in .nightshift.json only (trimmed). No git-remote merge.
 resolved_ado_metadata() {
-    local repo_dir="$1"
+    local repo_dir="${1-}"
     local repo_config="${2-}"
     [[ -z "$repo_config" ]] && repo_config="{}"
 
-    local remote_url normalized parsed
+    jq -n --argjson cfg "$repo_config" '
+        def trim: gsub("^\\s+|\\s+$"; "");
+        ($cfg | .ado_org // "") as $o | ($cfg | .ado_project // "") as $p | ($cfg | .ado_repo // "") as $r
+        | {
+            org: (if (($o | trim | length) > 0) then ($o | trim) else null end),
+            project: (if (($p | trim | length) > 0) then ($p | trim) else null end),
+            repo: (if (($r | trim | length) > 0) then ($r | trim) else null end)
+          }
+    '
+}
+
+# True when provider is pinned to Azure DevOps and all identity fields are saved (non-whitespace).
+ado_repo_config_has_explicit_saved_identity() {
+    local cfg="${1-}"
+    echo "$cfg" | jq -e '
+        (.provider == "azuredevops")
+        and (.ado_org | type == "string") and (.ado_org | gsub("^\\s+|\\s+$"; "") | length > 0)
+        and (.ado_project | type == "string") and (.ado_project | gsub("^\\s+|\\s+$"; "") | length > 0)
+        and (.ado_repo | type == "string") and (.ado_repo | gsub("^\\s+|\\s+$"; "") | length > 0)
+    ' &>/dev/null
+}
+
+# Optional JSON identity from parsed origin remote (same shape as resolved_ado_metadata), or prints null.
+ado_suggested_identity_from_git_remote() {
+    local repo_dir="${1-}"
+    local remote_url normalized
     remote_url="$(git -C "$repo_dir" remote get-url origin 2>/dev/null || true)"
     normalized="$(strip_remote_credentials "$remote_url")"
-    parsed="null"
     if p="$(parse_ado_remote "$normalized" 2>/dev/null)"; then
-        parsed="$p"
+        echo "$p"
+    else
+        echo "null"
     fi
+}
 
-    jq -n \
-        --argjson parsed "$parsed" \
-        --argjson cfg "$repo_config" \
-        '
-        (if $parsed == null then {"org": null, "project": null, "repo": null} else $parsed end)
-        | .org = (
-            if ($cfg.ado_org | type == "string") and ($cfg.ado_org | length) > 0
-            then $cfg.ado_org else .org end)
-        | .project = (
-            if ($cfg.ado_project | type == "string") and ($cfg.ado_project | length) > 0
-            then $cfg.ado_project else .project end)
-        | .repo = (
-            if ($cfg.ado_repo | type == "string") and ($cfg.ado_repo | length) > 0
-            then $cfg.ado_repo else .repo end)
-        '
+# Exit 0 if saved triple disagrees with a parseable ADO remote (same org/project/repo after trim).
+ado_identity_drifts_from_git_remote() {
+    local repo_dir="${1-}"
+    local repo_config="${2-}"
+    local sug="$3"
+    if [[ "$sug" == "null" ]] || [[ -z "$sug" ]]; then
+        return 1
+    fi
+    if ! ado_repo_config_has_explicit_saved_identity "$repo_config"; then
+        return 1
+    fi
+    jq -n --argjson remote "$sug" --argjson cfg "$repo_config" '
+        def trim: gsub("^\\s+|\\s+$"; "");
+        (($cfg.ado_org // "") | trim) as $co
+        | (($cfg.ado_project // "") | trim) as $cp
+        | (($cfg.ado_repo // "") | trim) as $cr
+        | (($remote.org // "") | trim) as $ro
+        | (($remote.project // "") | trim) as $rp
+        | (($remote.repo // "") | trim) as $rr
+        | ($co != $ro or $cp != $rp or $cr != $rr)
+    ' | grep -qx true
+}
+
+ado_org_for_pat_probe() {
+    local repo_dir="${1-}"
+    local repo_config="${2-}"
+    if ado_repo_config_has_explicit_saved_identity "$repo_config"; then
+        jq -rn --argjson cfg "$repo_config" '($cfg.ado_org // "") | gsub("^\\s+|\\s+$"; "")'
+        return 0
+    fi
+    local sug
+    sug="$(ado_suggested_identity_from_git_remote "$repo_dir")"
+    if [[ "$sug" != "null" ]]; then
+        echo "$sug" | jq -r '.org // empty'
+    fi
+}
+
+# Atomic write of merged JSON object to repo_dir/.nightshift.json — preserves unrelated keys callers merge via jq beforehand.
+_repo_write_nightshift_json_atomic() {
+    local repo_dir="${1-}"
+    local json_blob="${2-}"
+    local tmp
+    tmp="$(mktemp "${repo_dir%/}/.nightshift.json.tmp.XXXXXX")"
+    if ! printf '%s\n' "$json_blob" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv "$tmp" "${repo_dir%/}/.nightshift.json"
+}
+
+ado_err_invalid_ado_identity() {
+    local repo_dir="${2-}"
+    echo "Error: ${1} — Configure Azure DevOps identity in repo \"$(basename "${repo_dir}")/.nightshift.json\" (provider, ado_org, ado_project, ado_repo); run \"nightshift init\" to repair." >&2
+}
+
+# Ensures explicit saved identity matches git remote when parseable; returns resolved JSON or fails with stderr (repo_dir, repo_config, human label).
+ado_require_saved_identity_runtime() {
+    local repo_dir="${1-}"
+    local repo_config="${2-}"
+    local ctx="${3-Azure DevOps}"
+    [[ -z "$repo_config" ]] && repo_config="{}"
+
+    if ! ado_repo_config_has_explicit_saved_identity "$repo_config"; then
+        ado_err_invalid_ado_identity "${ctx}: Azure DevOps identity incomplete or missing provider" "$repo_dir"
+        return 1
+    fi
+    local sug
+    sug="$(ado_suggested_identity_from_git_remote "$repo_dir")"
+    if [[ "$sug" != "null" ]] && ado_identity_drifts_from_git_remote "$repo_dir" "$repo_config" "$sug"; then
+        ado_err_invalid_ado_identity "${ctx}: saved ADO identity does not match origin remote (drift)" "$repo_dir"
+        return 1
+    fi
+    resolved_ado_metadata "$repo_dir" "$repo_config"
 }
 
 # --- Azure DevOps REST (api-version=7.1) ---
@@ -657,28 +751,24 @@ create_ado_work_item() {
         return 1
     fi
 
-    local meta org project repo
-    meta="$(resolved_ado_metadata "$repo_dir" "$repo_config")"
-    org="$(echo "$meta" | jq -r '.org // empty')"
-    project="$(echo "$meta" | jq -r '.project // empty')"
-    repo="$(echo "$meta" | jq -r '.repo // empty')"
+    local meta org project repo wit_type
 
-    if [[ -z "$org" ]] || [[ -z "$project" ]] || [[ -z "$repo" ]] || [[ "$org" == "null" ]]; then
-        echo "Error: Cannot create Azure DevOps work item: missing organization, project, or repository (check git remote and .nightshift.json ado_* fields)." >&2
+    if ! meta="$(ado_require_saved_identity_runtime "$repo_dir" "$repo_config" "Cannot create work item")"; then
         return 1
     fi
 
-    local wit_type global_default
+    org="$(echo "$meta" | jq -r '.org // empty')"
+    project="$(echo "$meta" | jq -r '.project // empty')"
+    repo="$(echo "$meta" | jq -r '.repo // empty')"
     wit_type="$(echo "$repo_config" | jq -r '.ado_work_item_type // empty' 2>/dev/null)"
-    global_default=""
-    if [[ -f "$CONFIG_FILE" ]]; then
-        global_default="$(jq -r '.ado_default_work_item_type // empty' "$CONFIG_FILE" 2>/dev/null)" || global_default=""
-    fi
+
     if [[ -z "$wit_type" ]] || [[ "$wit_type" == "null" ]]; then
-        wit_type="$global_default"
+        echo "Error: Cannot create Azure DevOps work item: ado_work_item_type is missing in repo .nightshift.json — run \"nightshift init\"." >&2
+        return 1
     fi
-    if [[ -z "$wit_type" ]] || [[ "$wit_type" == "null" ]]; then
-        wit_type="Product Backlog Item"
+    if ado_wit_name_is_forbidden_builtin_task "$wit_type"; then
+        echo "Error: Cannot create Azure DevOps work item: built-in Task work item type is not allowed." >&2
+        return 1
     fi
 
     local agent_label area_path iteration_path
@@ -766,15 +856,13 @@ fetch_ado_work_items() {
     fi
 
     local meta org project repo
-    meta="$(resolved_ado_metadata "$repo_dir" "$repo_config")"
-    org="$(echo "$meta" | jq -r '.org // empty')"
-    project="$(echo "$meta" | jq -r '.project // empty')"
-    repo="$(echo "$meta" | jq -r '.repo // empty')"
-
-    if [[ -z "$org" ]] || [[ -z "$project" ]] || [[ -z "$repo" ]] || [[ "$org" == "null" ]]; then
+    if ! meta="$(ado_require_saved_identity_runtime "$repo_dir" "$repo_config" "Listing work items")"; then
         _ado_work_items_abort_or_empty
         return
     fi
+    org="$(echo "$meta" | jq -r '.org // empty')"
+    project="$(echo "$meta" | jq -r '.project // empty')"
+    repo="$(echo "$meta" | jq -r '.repo // empty')"
 
     local repo_esc="$repo"
     repo_esc="${repo_esc//\'/\'\'}"
@@ -852,15 +940,13 @@ fetch_ado_prs() {
     fi
 
     local meta org project reponame
-    meta="$(resolved_ado_metadata "$repo_dir" "$repo_config")"
-    org="$(echo "$meta" | jq -r '.org // empty')"
-    project="$(echo "$meta" | jq -r '.project // empty')"
-    reponame="$(echo "$meta" | jq -r '.repo // empty')"
-
-    if [[ -z "$org" ]] || [[ -z "$project" ]] || [[ -z "$reponame" ]] || [[ "$org" == "null" ]]; then
+    if ! meta="$(ado_require_saved_identity_runtime "$repo_dir" "$repo_config" "Listing pull requests")"; then
         _ado_prs_abort_or_none
         return
     fi
+    org="$(echo "$meta" | jq -r '.org // empty')"
+    project="$(echo "$meta" | jq -r '.project // empty')"
+    reponame="$(echo "$meta" | jq -r '.repo // empty')"
 
     local base enc_project enc_repo pr_path pr_json
     base="https://dev.azure.com/${org}"
@@ -948,6 +1034,10 @@ ado_fetch_wit_required_fields_json() {
         echo "ado_fetch_wit_required_fields_json: org, project, and work item type are required" >&2
         return 1
     fi
+    if ado_wit_name_is_forbidden_builtin_task "$wit"; then
+        echo "ado_fetch_wit_required_fields_json: built-in Task work item type is not allowed" >&2
+        return 1
+    fi
     local base enc_project type_seg path resp
     base="https://dev.azure.com/${org}"
     enc_project="$(jq -rn --arg p "$project" '$p|@uri')"
@@ -960,21 +1050,23 @@ ado_fetch_wit_required_fields_json() {
 }
 
 # init_normalize_work_item_type_choice <user_input_or_empty>
-# Maps PBI/Bug/Task (any case) or full names to canonical ADO type string.
+# Maps PBI/Bug (any case) or full/custom names to canonical strings. Builtin Task is forbidden (exact match after trim).
+# Returns non-zero if the builtin Task type was requested.
 init_normalize_work_item_type_choice() {
     local raw="${1-}"
     raw="$(echo "$raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     local lower
     lower="$(echo "$raw" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$lower" == "task" ]]; then
+        echo "Azure DevOps built-in Task work item type is not allowed; use PBIs or Bugs or a custom type whose name is not literally \"task\"." >&2
+        return 1
+    fi
     case "$lower" in
         ""|pbi|"product backlog item")
             echo "Product Backlog Item"
             ;;
         bug)
             echo "Bug"
-            ;;
-        task)
-            echo "Task"
             ;;
         *)
             echo "$raw"
@@ -1246,14 +1338,14 @@ cmd_run() {
         local scan_provider
         scan_provider="$(detect_provider "$repo_dir_scan" "$scan_config")"
         if [[ "$scan_provider" == "azuredevops" ]]; then
-            local scan_org
-            scan_org="$(resolved_ado_metadata "$repo_dir_scan" "$scan_config" | jq -r '.org // empty')"
-            if [[ -z "$scan_org" ]] || [[ "$scan_org" == "null" ]]; then
-                log "Error: Azure DevOps provider for $(basename "$repo_dir_scan") but organization could not be resolved (check git remote and .nightshift.json ado_org)."
-                record_run_error auth "$(basename "$repo_dir_scan")" "Organization could not be resolved (check git remote and .nightshift.json ado_org)"
+            local scan_meta scan_org
+            if ! scan_meta="$(ado_require_saved_identity_runtime "$repo_dir_scan" "$scan_config" "Run preflight")"; then
+                log "Error: Azure DevOps identity invalid for $(basename "$repo_dir_scan") — run \"nightshift init\" to set provider, ado_org, ado_project, and ado_repo (must match origin)."
+                record_run_error auth "$(basename "$repo_dir_scan")" "Azure DevOps identity missing, incomplete, or drifted from origin"
                 skip_repos="${skip_repos}${repo_dir_scan}"$'\n'
                 ERRORS=$((ERRORS + 1))
             else
+                scan_org="$(echo "$scan_meta" | jq -r '.org // empty')"
                 ado_repos_qualified="${ado_repos_qualified}${repo_dir_scan}|${scan_org}"$'\n'
             fi
         else
@@ -1438,24 +1530,65 @@ cmd_init_process_ado_repos() {
             continue
         fi
 
-        local meta org project reponame
-        meta="$(resolved_ado_metadata "$repo_dir" "$pc")"
-        org="$(echo "$meta" | jq -r '.org // empty')"
-        project="$(echo "$meta" | jq -r '.project // empty')"
-        reponame="$(echo "$meta" | jq -r '.repo // empty')"
-        if [[ -z "$org" ]] || [[ "$org" == "null" ]] || [[ -z "$project" ]] || [[ "$project" == "null" ]]; then
-            echo "  $repo_name: skip ADO config (could not resolve organization/project from remote or .nightshift.json)"
-            continue
+        local sug org project reponame fixdrift
+        sug="$(ado_suggested_identity_from_git_remote "$repo_dir")"
+        org=""
+        project=""
+        reponame=""
+
+        if ado_repo_config_has_explicit_saved_identity "$pc"; then
+            org="$(echo "$pc" | jq -r '.ado_org // ""' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            project="$(echo "$pc" | jq -r '.ado_project // ""' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            reponame="$(echo "$pc" | jq -r '.ado_repo // ""' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            if [[ "$sug" != "null" ]] && ado_identity_drifts_from_git_remote "$repo_dir" "$pc" "$sug"; then
+                echo "  $repo_name: saved Azure DevOps identity differs from git origin."
+                read -r -p "  Replace saved identity with values from origin? [y/N]: " fixdrift || fixdrift=""
+                if [[ "$fixdrift" == "y" ]] || [[ "$fixdrift" == "Y" ]]; then
+                    org="$(echo "$sug" | jq -r '.org')"
+                    project="$(echo "$sug" | jq -r '.project')"
+                    reponame="$(echo "$sug" | jq -r '.repo')"
+                fi
+            fi
+        else
+            if [[ "$sug" != "null" ]]; then
+                org="$(echo "$sug" | jq -r '.org')"
+                project="$(echo "$sug" | jq -r '.project')"
+                reponame="$(echo "$sug" | jq -r '.repo')"
+            fi
+            local o_in p_in r_in
+            while [[ -z "$org" ]]; do
+                read -r -p "  Azure DevOps organization (https://dev.azure.com/<name>): " o_in || o_in=""
+                org="$(echo "$o_in" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            done
+            while [[ -z "$project" ]]; do
+                read -r -p "  Azure DevOps project name: " p_in || p_in=""
+                project="$(echo "$p_in" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            done
+            while [[ -z "$reponame" ]]; do
+                read -r -p "  Azure DevOps repository name: " r_in || r_in=""
+                reponame="$(echo "$r_in" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            done
         fi
 
         local wit wit_in saved_type
+        wit=""
         saved_type="$(echo "$pc" | jq -r '.ado_work_item_type // empty' 2>/dev/null)" || saved_type=""
         if [[ -n "$saved_type" ]] && [[ "$saved_type" != "null" ]]; then
-            wit="$saved_type"
-            echo "  $repo_name: work item type (saved): $wit"
-        else
-            read -r -p "  Work item type for $repo_name — PBI, Bug, or Task [$(init_wit_to_short_label "$global_wit_full")]: " wit_in || wit_in=""
-            wit="$(init_normalize_work_item_type_choice "${wit_in:-$global_wit_full}")"
+            if ado_wit_name_is_forbidden_builtin_task "$saved_type"; then
+                echo "  $repo_name: saved work item type is the built-in Task, which is not allowed — choose another type."
+            else
+                wit="$saved_type"
+                echo "  $repo_name: work item type (saved): $wit"
+            fi
+        fi
+        if [[ -z "$wit" ]]; then
+            while true; do
+                read -r -p "  Work item type for $repo_name — PBI, Bug, or custom name [$(init_wit_to_short_label "$global_wit_full")]: " wit_in || wit_in=""
+                if ! wit="$(init_normalize_work_item_type_choice "${wit_in:-$global_wit_full}")"; then
+                    continue
+                fi
+                break
+            done
         fi
 
         local required_json
@@ -1465,14 +1598,33 @@ cmd_init_process_ado_repos() {
         fi
 
         if init_ado_repo_fully_configured "$pc" "$required_json" "$wit"; then
-            echo "  $repo_name: ADO settings already present; no changes"
-            local subset_fields
-            subset_fields="$(echo "$pc" | jq --argjson req "$required_json" '
+            if ado_repo_config_has_explicit_saved_identity "$pc"; then
+                echo "  $repo_name: ADO settings already present; no changes"
+                local subset_fields
+                subset_fields="$(echo "$pc" | jq --argjson req "$required_json" '
+                    ($req | map(.referenceName)) as $keys
+                    | (.ado_fields // {})
+                    | with_entries(select(.key as $k | $keys | index($k) != null))
+                ')"
+                printf '%s\t%s\n' "${org}|${project}|${wit}" "$(echo "$subset_fields" | jq -c .)" >> "$reuse_state"
+                continue
+            fi
+            local cfg_mig
+            cfg_mig="$(echo "$pc" | jq \
+                --arg prov "azuredevops" \
+                --arg org "$org" \
+                --arg project "$project" \
+                --arg rep "$reponame" \
+                '.provider = $prov | .ado_org = $org | .ado_project = $project | .ado_repo = $rep')"
+            _repo_write_nightshift_json_atomic "$repo_dir" "$(echo "$cfg_mig" | jq -c .)"
+            echo "  $repo_name: persisted explicit Azure DevOps identity only (required fields unchanged)"
+            local subset_fields2
+            subset_fields2="$(echo "$pc" | jq --argjson req "$required_json" '
                 ($req | map(.referenceName)) as $keys
                 | (.ado_fields // {})
                 | with_entries(select(.key as $k | $keys | index($k) != null))
             ')"
-            printf '%s\t%s\n' "${org}|${project}|${wit}" "$(echo "$subset_fields" | jq -c .)" >> "$reuse_state"
+            printf '%s\t%s\n' "${org}|${project}|${wit}" "$(echo "$subset_fields2" | jq -c .)" >> "$reuse_state"
             continue
         fi
 
@@ -1523,15 +1675,26 @@ cmd_init_process_ado_repos() {
 
         local cfg_out cfg_before
         cfg_before="$(echo "$pc" | jq -c . 2>/dev/null)" || cfg_before="{}"
-        cfg_out="$(echo "$pc" | jq --arg wit "$wit" --argjson fields "$final_fields" \
-            '.ado_work_item_type = $wit | .ado_fields = $fields')"
+        cfg_out="$(echo "$pc" | jq \
+            --arg prov "azuredevops" \
+            --arg org "$org" \
+            --arg project "$project" \
+            --arg rep "$reponame" \
+            --arg wit "$wit" \
+            --argjson fields "$final_fields" \
+            '.provider = $prov
+             | .ado_org = $org
+             | .ado_project = $project
+             | .ado_repo = $rep
+             | .ado_work_item_type = $wit
+             | .ado_fields = $fields')"
 
         if [[ "$cfg_before" == "$(echo "$cfg_out" | jq -c .)" ]]; then
             echo "  $repo_name: no updates needed"
             continue
         fi
 
-        printf '%s\n' "$cfg_out" > "$repo_dir/.nightshift.json"
+        _repo_write_nightshift_json_atomic "$repo_dir" "$(echo "$cfg_out" | jq -c .)"
         echo "  $repo_name: wrote .nightshift.json"
 
         printf '%s\t%s\n' "$cache_key" "$(echo "$final_fields" | jq -c .)" >> "$reuse_state"
@@ -1545,7 +1708,6 @@ init_wit_to_short_label() {
     case "${1-}" in
         "Product Backlog Item") echo "PBI" ;;
         Bug)                    echo "Bug" ;;
-        Task)                   echo "Task" ;;
         *)                      echo "${1:-PBI}" ;;
     esac
 }
@@ -1656,7 +1818,7 @@ cmd_init() {
             if [[ "$(detect_provider "$repo_line" "$pc")" != "azuredevops" ]]; then
                 continue
             fi
-            org="$(resolved_ado_metadata "$repo_line" "$pc" | jq -r '.org // empty')"
+            org="$(ado_org_for_pat_probe "$repo_line" "$pc")"
             if [[ -n "$org" ]] && [[ "$org" != "null" ]]; then
                 org_lines="${org_lines}${org}"$'\n'
             fi
@@ -1681,12 +1843,19 @@ cmd_init() {
 
         local wit_g_in
         echo "Azure DevOps: choose the default work item type for new repos (you can override per repo)."
-        read -r -p "Default work item type (PBI, Bug, Task) [$wit_prompt_default]: " wit_g_in || wit_g_in=""
-        if [[ -n "$wit_g_in" ]]; then
-            ado_default_wit_full="$(init_normalize_work_item_type_choice "$wit_g_in")"
-        else
-            ado_default_wit_full="$(init_normalize_work_item_type_choice "$wit_prompt_default")"
-        fi
+        while true; do
+            read -r -p "Default work item type (PBI, Bug) [$wit_prompt_default]: " wit_g_in || wit_g_in=""
+            if [[ -n "$wit_g_in" ]]; then
+                if ! ado_default_wit_full="$(init_normalize_work_item_type_choice "$wit_g_in")"; then
+                    continue
+                fi
+            else
+                if ! ado_default_wit_full="$(init_normalize_work_item_type_choice "$wit_prompt_default")"; then
+                    continue
+                fi
+            fi
+            break
+        done
         echo ""
     fi
 

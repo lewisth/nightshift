@@ -92,16 +92,24 @@ p="$(detect_provider "$tmp/gh" '{"provider":"azuredevops"}')"
 p="$(detect_provider "$tmp/ado" '{"provider":"github"}')"
 [[ "$p" == "github" ]] || fail "override provider to github: $p"
 
-# --- resolved_ado_metadata overrides ---
+# --- resolved_ado_metadata (saved config only; no git-remote merge) ---
 
-meta="$(resolved_ado_metadata "$tmp/ado" '{"ado_repo":"OverrideRepo"}')"
+meta="$(resolved_ado_metadata "$tmp/ado" '{"provider":"azuredevops","ado_org":"contoso","ado_project":"Fabrikam","ado_repo":"OverrideRepo"}')"
 assert_json_eq repo OverrideRepo "$meta"
 assert_json_eq org contoso "$meta"
 
-meta="$(resolved_ado_metadata "$tmp/gh" '{"ado_org":"x","ado_project":"y","ado_repo":"z"}')"
+meta="$(resolved_ado_metadata "$tmp/gh" '{"provider":"azuredevops","ado_org":"x","ado_project":"y","ado_repo":"z"}')"
 assert_json_eq org x "$meta"
 assert_json_eq project y "$meta"
 assert_json_eq repo z "$meta"
+
+if init_normalize_work_item_type_choice " task " 2>"$tmp/errwit"; then
+    fail "Task should be rejected"
+fi
+if ! wit="$(init_normalize_work_item_type_choice "My Task Story")"; then
+    fail "custom type containing task substring should be allowed"
+fi
+[[ "$wit" == "My Task Story" ]] || fail "expected custom wit, got $wit"
 
 # --- provider dispatch (GitHub path via gh stub) ---
 

@@ -90,6 +90,8 @@ fail() {
   exit 1
 }
 
+ADO_TEST_IDENTITY="$(jq -nc '{provider:"azuredevops",ado_org:"contoso",ado_project:"Fabrikam",ado_repo:"FabrikamFiber"}')"
+
 # --- require_ado_pat / missing PAT ---
 
 unset NIGHTSHIFT_ADO_PAT
@@ -223,7 +225,7 @@ export NIGHTSHIFT_MOCK_HTTP_CODE=200
 export NIGHTSHIFT_MOCK_STATE="$tmp_root/seqwiql"
 echo 0 > "$NIGHTSHIFT_MOCK_STATE"
 unset NIGHTSHIFT_MOCK_BODY
-out="$(fetch_ado_work_items "$tmp_root/adowiql" '{}')"
+out="$(fetch_ado_work_items "$tmp_root/adowiql" "$ADO_TEST_IDENTITY")"
 unset NIGHTSHIFT_MOCK_STATE
 if [[ "$out" != $'Alpha\nBeta' ]]; then
   fail "want Alpha/Beta titles, got: $out"
@@ -232,7 +234,7 @@ fi
 unset NIGHTSHIFT_MOCK_STATE
 export NIGHTSHIFT_MOCK_BODY='{"workItems":[]}'
 export NIGHTSHIFT_MOCK_HTTP_CODE=200
-out="$(fetch_ado_work_items "$tmp_root/adowiql" '{}')"
+out="$(fetch_ado_work_items "$tmp_root/adowiql" "$ADO_TEST_IDENTITY")"
 unset NIGHTSHIFT_MOCK_BODY
 if [[ -n "$out" ]]; then
   fail "empty workItems should yield empty string"
@@ -240,7 +242,7 @@ fi
 
 export NIGHTSHIFT_MOCK_HTTP_CODE=503
 unset NIGHTSHIFT_MOCK_STATE
-out="$(fetch_ado_work_items "$tmp_root/adowiql" '{}')"
+out="$(fetch_ado_work_items "$tmp_root/adowiql" "$ADO_TEST_IDENTITY")"
 if [[ -n "$out" ]]; then
   fail "API error should yield empty titles"
 fi
@@ -255,7 +257,7 @@ fi
 
 export NIGHTSHIFT_ADO_PAT="test-pat"
 mkrepo "$tmp_root/adoprs" 'https://dev.azure.com/contoso/Fabrikam/_git/FabrikamFiber'
-out="$(fetch_ado_prs "$tmp_root/adoprs" '{}')"
+out="$(fetch_ado_prs "$tmp_root/adoprs" "$ADO_TEST_IDENTITY")"
 if [[ "$out" != "None" ]]; then
   fail "PR fetch with no mock body: expected None, got: $out"
 fi
@@ -264,7 +266,7 @@ pr_log="$(mktemp)"
 export NIGHTSHIFT_MOCK_CURL_LOG="$pr_log"
 export NIGHTSHIFT_MOCK_HTTP_CODE=200
 export NIGHTSHIFT_MOCK_BODY='{"value":[{"title":"Fix bug","description":"Details here"},{"title":"WIP","description":null}]}'
-out="$(fetch_ado_prs "$tmp_root/adoprs" '{}')"
+out="$(fetch_ado_prs "$tmp_root/adoprs" "$ADO_TEST_IDENTITY")"
 want=$'PR: Fix bug\nDetails here\n---\nPR: WIP\n\n---'
 if [[ "$out" != "$want" ]]; then
   fail "PR format mismatch, got: $(printf %s "$out" | od -c | head -5) want: $(printf %s "$want" | od -c | head -5)"
@@ -279,7 +281,7 @@ fi
 unset NIGHTSHIFT_MOCK_BODY
 
 export NIGHTSHIFT_MOCK_BODY='{"value":[]}'
-out="$(fetch_ado_prs "$tmp_root/adoprs" '{}')"
+out="$(fetch_ado_prs "$tmp_root/adoprs" "$ADO_TEST_IDENTITY")"
 unset NIGHTSHIFT_MOCK_BODY
 if [[ "$out" != "None" ]]; then
   fail "empty value[] should be None, got: $out"
@@ -287,7 +289,7 @@ fi
 
 export NIGHTSHIFT_MOCK_HTTP_CODE=503
 unset NIGHTSHIFT_MOCK_BODY
-out="$(fetch_ado_prs "$tmp_root/adoprs" '{}')"
+out="$(fetch_ado_prs "$tmp_root/adoprs" "$ADO_TEST_IDENTITY")"
 if [[ "$out" != "None" ]]; then
   fail "PR API error should yield None, got: $out"
 fi
@@ -309,15 +311,16 @@ ado_bash() {
 
 cfg_home="$tmp_root/cfghome"
 mkdir -p "$cfg_home/.nightshift"
-printf '%s\n' '{"ado_default_work_item_type":"Task"}' > "$cfg_home/.nightshift/config.json"
+printf '%s\n' '{"ado_default_work_item_type":"Bug"}' > "$cfg_home/.nightshift/config.json"
 
-cat > "$tmp_root/repo12.json" <<'JSON'
-{
-  "ado_area_path": "Fabrikam\\Area",
-  "ado_iteration_path": "Fabrikam\\Sprint 1",
-  "ado_fields": {"Custom.Required": "value1"}
-}
-JSON
+jq -nc \
+  --argjson id "$ADO_TEST_IDENTITY" \
+  '$id * {
+    ado_work_item_type: "Product Backlog Item",
+    ado_area_path: "Fabrikam\\Area",
+    ado_iteration_path: "Fabrikam\\Sprint 1",
+    ado_fields: {"Custom.Required": "value1"}
+  }' > "$tmp_root/repo12.json"
 
 unset NIGHTSHIFT_ADO_PAT
 if ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/adowiql\" \"\$(cat \"$tmp_root/repo12.json\")\" bugs \"[nightshift] T\" \"Body\"" 2>"$errdir/errcwi0"; then
@@ -331,8 +334,8 @@ export NIGHTSHIFT_ADO_PAT="test-pat"
 if ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/ghonly\" \"{}\" bugs \"[nightshift] T\" \"Body\"" 2>"$errdir/errcwi1"; then
   fail "create without ADO metadata should fail"
 fi
-if ! grep -q "Cannot create Azure DevOps work item" "$errdir/errcwi1"; then
-  fail "expected metadata error: $(cat "$errdir/errcwi1")"
+if ! grep -q "identity incomplete" "$errdir/errcwi1"; then
+  fail "expected incomplete ADO identity error: $(cat "$errdir/errcwi1")"
 fi
 
 hdrlog="$(mktemp)"
@@ -350,8 +353,8 @@ if ! grep -q 'application/json-patch+json' "$hdrlog"; then
   fail "expected Content-Type json-patch+json in headers, got: $(cat "$hdrlog")"
 fi
 uwi="$(cat "$urlog")"
-if [[ "$uwi" != *"workitems/%24Task"* ]] && [[ "$uwi" != *'workitems/$Task'* ]]; then
-  fail "expected workitems \$Task in URL (global default), got: $uwi"
+if [[ "$uwi" != *"%24Product%20Backlog%20Item"* ]] && [[ "$uwi" != *'workitems/$Product%20Backlog%20Item'* ]]; then
+  fail "expected Product Backlog Item in URL, got: $uwi"
 fi
 patch_body="$(cat "$bodylog")"
 if ! echo "$patch_body" | jq -e . >/dev/null; then
@@ -380,17 +383,18 @@ fi
 export NIGHTSHIFT_MOCK_CURL_LOG="$urlog"
 export NIGHTSHIFT_MOCK_HTTP_CODE=200
 export NIGHTSHIFT_MOCK_BODY='{"id":100,"rev":1}'
-if ! ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/adowiql\" '{\"ado_work_item_type\":\"Bug\"}' bugs \"[nightshift] X\" \"D\""; then
+BUG_CFG="$(jq -nc --argjson id "$ADO_TEST_IDENTITY" '$id * {ado_work_item_type:"Bug"}')"
+if ! ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/adowiql\" $(printf '%q' "$BUG_CFG") bugs \"[nightshift] X\" \"D\""; then
   fail "create Bug type failed"
 fi
 uwi2="$(cat "$urlog")"
 if [[ "$uwi2" != *"%24Bug"* ]] && [[ "$uwi2" != *'$Bug'* ]]; then
-  fail "repo ado_work_item_type should override global Task: $uwi2"
+  fail "Bug work item URL: $uwi2"
 fi
 
 export NIGHTSHIFT_MOCK_HTTP_CODE=400
 export NIGHTSHIFT_MOCK_BODY='{"message":"invalid patch"}'
-if ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/adowiql\" \"{}\" bugs \"[nightshift] Z\" \"D\"" 2>"$errdir/errcwi400"; then
+if ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/adowiql\" $(printf '%q' "$BUG_CFG") bugs \"[nightshift] Z\" \"D\"" 2>"$errdir/errcwi400"; then
   fail "HTTP 400 should fail create"
 fi
 if ! grep -q "400" "$errdir/errcwi400"; then
@@ -404,7 +408,7 @@ export NIGHTSHIFT_MOCK_HTTP_CODE=200
 export NIGHTSHIFT_MOCK_STATE="$tmp_root/seqdispatch"
 echo 0 > "$NIGHTSHIFT_MOCK_STATE"
 unset NIGHTSHIFT_MOCK_BODY
-out="$(fetch_open_issues_for_repo "$tmp_root/adowiql" '{}')"
+out="$(fetch_open_issues_for_repo "$tmp_root/adowiql" "$ADO_TEST_IDENTITY")"
 unset NIGHTSHIFT_MOCK_STATE
 if [[ "$out" != $'Alpha\nBeta' ]]; then
   fail "fetch_open_issues_for_repo ADO: want Alpha/Beta, got: $out"
@@ -412,7 +416,7 @@ fi
 
 export NIGHTSHIFT_MOCK_HTTP_CODE=200
 export NIGHTSHIFT_MOCK_BODY='{"value":[{"title":"D1","description":"X"}]}'
-out="$(fetch_open_prs_for_repo "$tmp_root/adoprs" '{}')"
+out="$(fetch_open_prs_for_repo "$tmp_root/adoprs" "$ADO_TEST_IDENTITY")"
 unset NIGHTSHIFT_MOCK_BODY
 want=$'PR: D1\nX\n---'
 if [[ "$out" != "$want" ]]; then
@@ -422,7 +426,7 @@ fi
 export NIGHTSHIFT_MOCK_CURL_LOG="$urlog"
 export NIGHTSHIFT_MOCK_HTTP_CODE=200
 export NIGHTSHIFT_MOCK_BODY='{"id":101,"rev":1}'
-if ! ado_bash "$cfg_home" "create_work_item_for_repo \"$tmp_root/adowiql\" '{\"ado_work_item_type\":\"Bug\"}' bugs bugs \"[nightshift] Dispatch\" \"Body\""; then
+if ! ado_bash "$cfg_home" "create_work_item_for_repo \"$tmp_root/adowiql\" $(printf '%q' "$BUG_CFG") bugs bugs \"[nightshift] Dispatch\" \"Body\""; then
   fail "create_work_item_for_repo ADO path should succeed"
 fi
 
@@ -437,13 +441,13 @@ fi
 export NIGHTSHIFT_ADO_PAT="test-pat"
 export NIGHTSHIFT_MOCK_HTTP_CODE=503
 unset NIGHTSHIFT_MOCK_STATE
-if out="$(fetch_ado_work_items "$tmp_root/adowiql" '{}')"; then
+if out="$(fetch_ado_work_items "$tmp_root/adowiql" "$ADO_TEST_IDENTITY")"; then
   fail "strict: HTTP 503 should fail fetch_ado_work_items"
 fi
 unset NIGHTSHIFT_ADO_STRICT
 
 export NIGHTSHIFT_MOCK_HTTP_CODE=503
-if ! out="$(fetch_ado_work_items "$tmp_root/adowiql" '{}')"; then
+if ! out="$(fetch_ado_work_items "$tmp_root/adowiql" "$ADO_TEST_IDENTITY")"; then
   fail "non-strict: fetch_ado_work_items should return 0 on 503 with empty titles"
 fi
 if [[ -n "$out" ]]; then
@@ -456,6 +460,7 @@ status_home="$tmp_root/statushome"
 repos_base="$tmp_root/status_repos"
 mkdir -p "$status_home/.nightshift" "$repos_base"
 mkrepo "$repos_base/ado1" 'https://dev.azure.com/contoso/Fabrikam/_git/R1'
+jq -n '{provider:"azuredevops",ado_org:"contoso",ado_project:"Fabrikam",ado_repo:"R1"}' > "$repos_base/ado1/.nightshift.json"
 mkrepo "$repos_base/gh1" 'https://github.com/a/b.git'
 jq -n --arg rr "$repos_base" \
   '{repos_root: $rr, schedule: "0 2 * * *", agents: {}}' > "$status_home/.nightshift/config.json"
