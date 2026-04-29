@@ -338,6 +338,13 @@ if ! grep -q "identity incomplete" "$errdir/errcwi1"; then
   fail "expected incomplete ADO identity error: $(cat "$errdir/errcwi1")"
 fi
 
+if ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/adowiql\" $(printf '%q' "$ADO_TEST_IDENTITY") bugs \"[nightshift] NoWit\" \"D\"" 2>"$errdir/errcwi_nowit"; then
+  fail "create should require per-repo ado_work_item_type; must not fall back to user ado_default_work_item_type"
+fi
+if ! grep -q "ado_work_item_type is missing" "$errdir/errcwi_nowit"; then
+  fail "expected missing per-repo WIT error, got: $(cat "$errdir/errcwi_nowit")"
+fi
+
 hdrlog="$(mktemp)"
 bodylog="$(mktemp)"
 urlog="$(mktemp)"
