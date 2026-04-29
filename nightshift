@@ -2159,10 +2159,19 @@ cmd_status() {
                 provider="$(detect_provider "$repo_dir" "$rcfg")"
                 ado_line=""
                 if [[ "$provider" == "azuredevops" ]]; then
-                    ado_line="$(resolved_ado_metadata "$repo_dir" "$rcfg" | jq -r '
-                        if (.org | type == "string") and (.project | type == "string") and (.repo | type == "string")
-                        then " (" + .org + "/" + .project + "/" + .repo + ")"
-                        else "" end' 2>/dev/null || true)"
+                    if ado_repo_config_has_explicit_saved_identity "$rcfg"; then
+                        ado_line="$(resolved_ado_metadata "$repo_dir" "$rcfg" | jq -r '
+                            if (.org | type == "string") and (.project | type == "string") and (.repo | type == "string")
+                            then " (" + .org + "/" + .project + "/" + .repo + ")"
+                            else "" end' 2>/dev/null || true)"
+                        local sug_status
+                        sug_status="$(ado_suggested_identity_from_git_remote "$repo_dir")"
+                        if [[ "$sug_status" != "null" ]] && ado_identity_drifts_from_git_remote "$repo_dir" "$rcfg" "$sug_status"; then
+                            ado_line="${ado_line} [invalid: saved identity differs from git origin]"
+                        fi
+                    else
+                        ado_line=" (Azure DevOps provider set — identity incomplete — run \"nightshift init\")"
+                    fi
                 elif git_origin_matches_azure_devops "$repo_dir"; then
                     ado_line=" (Azure DevOps remote — run nightshift init to pin provider and identity)"
                 fi
