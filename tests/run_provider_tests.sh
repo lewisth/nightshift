@@ -111,6 +111,16 @@ if ! wit="$(init_normalize_work_item_type_choice "My Task Story")"; then
 fi
 [[ "$wit" == "My Task Story" ]] || fail "expected custom wit, got $wit"
 
+if ! ado_wit_name_is_forbidden_builtin_task "  TASK "; then
+    fail "builtin Task should be rejected (trim + case)"
+fi
+if ! ado_wit_name_is_forbidden_builtin_task $' \tTaSk\t '; then
+    fail "builtin Task should be rejected (internal ws + case)"
+fi
+if ado_wit_name_is_forbidden_builtin_task "My CustomerTask"; then
+    fail "custom WIT names that contain task as substring must not be blocked"
+fi
+
 # --- ado_require_saved_identity_runtime: drift vs git origin ---
 mkrepo "$tmp/driftADO" 'https://dev.azure.com/contoso/Fabrikam/_git/FabrikamFiber'
 drift_cfg="$(jq -nc '{provider:"azuredevops",ado_org:"wrongorg",ado_project:"Fabrikam",ado_repo:"FabrikamFiber"}')"

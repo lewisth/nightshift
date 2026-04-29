@@ -447,6 +447,20 @@ ado_org_for_pat_probe() {
     fi
 }
 
+# Atomic write for ~/.nightshift/config.json (preserve crash safety on re-init).
+_nightshift_write_user_config_atomic() {
+    local json_blob="${1-}"
+    local dir tmp
+    dir="${NIGHTSHIFT_DIR}"
+    mkdir -p "$dir"
+    tmp="$(mktemp "${dir%/}/config.json.tmp.XXXXXX")"
+    if ! printf '%s\n' "$json_blob" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv "$tmp" "$CONFIG_FILE"
+}
+
 # Atomic write of merged JSON object to repo_dir/.nightshift.json — preserves unrelated keys callers merge via jq beforehand.
 _repo_write_nightshift_json_atomic() {
     local repo_dir="${1-}"
@@ -776,6 +790,7 @@ create_ado_work_item() {
     project="$(echo "$meta" | jq -r '.project // empty')"
     repo="$(echo "$meta" | jq -r '.repo // empty')"
     wit_type="$(echo "$repo_config" | jq -r '.ado_work_item_type // empty' 2>/dev/null)"
+    wit_type="$(echo "$wit_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 
     if [[ -z "$wit_type" ]] || [[ "$wit_type" == "null" ]]; then
         echo "Error: Cannot create Azure DevOps work item: ado_work_item_type is missing in repo .nightshift.json — run \"nightshift init\"." >&2
@@ -1093,12 +1108,14 @@ init_normalize_work_item_type_choice() {
 # Returns 0 if ado_work_item_type matches and ado_fields contains a non-empty string for each required referenceName.
 init_ado_repo_fully_configured() {
     local cfg="${1-}" required_json="${2-}" wit="${3-}"
-    local saved_type
+    local saved_type wit_trim
     saved_type="$(echo "$cfg" | jq -r '.ado_work_item_type // empty' 2>/dev/null)" || saved_type=""
+    saved_type="$(echo "$saved_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    wit_trim="$(echo "$wit" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     if [[ -z "$saved_type" ]] || [[ "$saved_type" == "null" ]]; then
         return 1
     fi
-    if [[ "$saved_type" != "$wit" ]]; then
+    if [[ "$saved_type" != "$wit_trim" ]]; then
         return 1
     fi
     if ! echo "$cfg" | jq -e '(.ado_fields | type) == "object"' &>/dev/null; then
@@ -1582,6 +1599,8 @@ cmd_init_process_ado_repos() {
                     org="$(echo "$sug" | jq -r '.org')"
                     project="$(echo "$sug" | jq -r '.project')"
                     reponame="$(echo "$sug" | jq -r '.repo')"
+                else
+                    echo "  $repo_name: keeping saved identity — nightshift will refuse Azure DevOps runs until identity matches \"git remote get-url origin\" or you edit .nightshift.json; run \"nightshift init\" again to replace."
                 fi
             fi
         else
@@ -1960,7 +1979,7 @@ cmd_init() {
             '{repos_root: $repos_root, schedule: $schedule, agents: $agents}')"
     fi
 
-    echo "$config" > "$CONFIG_FILE"
+    _nightshift_write_user_config_atomic "$(echo "$config" | jq -c .)"
     echo "Config written to $CONFIG_FILE"
     echo ""
 

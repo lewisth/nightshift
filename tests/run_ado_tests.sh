@@ -392,6 +392,12 @@ if [[ "$uwi2" != *"%24Bug"* ]] && [[ "$uwi2" != *'$Bug'* ]]; then
   fail "Bug work item URL: $uwi2"
 fi
 
+cfg_ws="$(jq -nc --argjson id "$ADO_TEST_IDENTITY" '$id * {ado_work_item_type:"   " }')"
+if ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/adowiql\" $(printf '%q' "$cfg_ws") bugs \"[nightshift] Ws\" \"D\"" 2>"$errdir/errcwi_ws"; then
+  fail "whitespace-only ado_work_item_type should be missing"
+fi
+grep -q "ado_work_item_type is missing" "$errdir/errcwi_ws" || fail "expected missing WIT err: $(cat "$errdir/errcwi_ws")"
+
 export NIGHTSHIFT_MOCK_HTTP_CODE=400
 export NIGHTSHIFT_MOCK_BODY='{"message":"invalid patch"}'
 if ado_bash "$cfg_home" "create_ado_work_item \"$tmp_root/adowiql\" $(printf '%q' "$BUG_CFG") bugs \"[nightshift] Z\" \"D\"" 2>"$errdir/errcwi400"; then
